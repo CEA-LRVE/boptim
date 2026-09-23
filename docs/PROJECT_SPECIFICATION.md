@@ -28,7 +28,8 @@
 ### 1.1 What this is
 
 `boptim` is a standalone Python library implementing Bayesian Optimization (BO) as a
-**general-purpose, domain-agnostic** tool. It is a generic black-box optimization engine that is used, among other
+**general-purpose, domain-agnostic** tool. It is a generic black-box optimization engine 
+that is used, among other
 things, by a laboratory and by machine-learning practitioners. Concretely, this means the
 library must be equally comfortable with:
 
@@ -74,7 +75,7 @@ expensive to change later; they are called out so they can be corrected in one p
 | Package name | `boptim` | Placeholder. Short, descriptive, likely available; verify on PyPI. |
 | `mypy` strictness | `--strict` | Matches "type hints mandatory everywhere" from section 10. |
 | License | Not set (TBD) | Depends on whether this stays internal or gets published; not an architectural decision. |
-| Build backend | `uv_build` (or `hatchling`) under `uv` | See ADR-0002 in section 4.5. |
+| Build backend | `uv_build` (or `hatchling`) under `uv` | See ADR-0002 in section 4.6. |
 
 ---
 
@@ -84,7 +85,7 @@ expensive to change later; they are called out so they can be corrected in one p
 |---|---|---|
 | FR1 | Define a search space with `float`, `int`, categorical and boolean parameters, with bounds and linear/log scales. | Log scale applies to `float`/`int` parameters. |
 | FR2 | Define one or more objectives, each minimized or maximized, with optional relative importance weights. | N = 1 must behave identically to a "simple" single-objective API; N > 1 supports both weighted and unweighted (Pareto) preference. |
-| FR3 | Manually inject an arbitrary (parameters, result) pair, bypassing `suggest()`. | Needed to seed a study from prior data, and to record points evaluated outside `boptim`. |
+| FR3 | Manually inject an arbitrary (parameters, result) pair, bypassing `ask()`. | Needed to seed a study from prior data, and to record points evaluated outside `boptim`. |
 | FR4 | Suggest the next point(s) automatically with a high-performing strategy, with no manual tuning of surrogate-model or acquisition-function hyperparameters required. | This is the "no manual tuning" requirement; it governs the *default* path, not the alpha-controlled path (FR5). |
 | FR5 | Control the exploration/exploitation trade-off with a single continuous parameter `alpha` in `[0, 1]`: `0.0` favors the best predicted objective (pure exploitation), `1.0` favors the least-known region of the search space (pure exploration), `0.5` balances both. | This is the requirement Ax does not expose natively; see section 4.3. |
 | FR6 | Report each parameter's importance with respect to each objective. | |
@@ -94,6 +95,8 @@ expensive to change later; they are called out so they can be corrected in one p
 | FR10 | Suggest a batch of `n >= 1` points in a single call, jointly optimized (not `n` copies of the same point). | Needed for parallel evaluations (e.g. several reactors, a well plate, several ML training jobs at once). |
 | FR11 | Save a study to disk and reload it later, resuming exactly where it left off. | A campaign can span days or weeks with the process restarting in between. |
 | FR12 | Make a saved study reproducible: the random seed, library versions, and full trial history are recorded, not just the final state. | |
+| FR13 | Support a per-parameter default value and, for `Real`/`Integer`, an optional fixed sampling step. | Ergonomics, not core optimization logic; added after seeing Keras Tuner's `HyperParameters` API. |
+| FR14 | Support conditional (hierarchical) parameters: a parameter that only applies when another parameter takes a specific value. | Added after seeing Keras Tuner's `conditional_scope`. Definition/persistence is solid; genuine optimization-quality benefit from the structure is weaker and tracked separately, see section 4.5. |
 
 ---
 
@@ -121,7 +124,7 @@ expensive to change later; they are called out so they can be corrected in one p
 ### 4.1 Component overview
 
 ```
-api/  Study                     <- the single public entry point
+api/  BayesianOptimizer                     <- the single public entry point
   |
   +-- domain/         pure Pydantic models, zero ML dependencies
   |
@@ -153,19 +156,20 @@ api/  Study                     <- the single public entry point
 
 ### 4.2 Data flow for a typical call
 
-1. Caller builds a `SearchSpace`, an `Objective`, optional `Constraint`s, and constructs a
-   `Study`.
-2. Caller calls `study.observe(...)` zero or more times to inject prior data (FR3).
-3. Caller calls `study.suggest(n_points=..., alpha=...)`.
-   - If `alpha` is left at its default (see 4.3), `Study` delegates to the Ax backend's default
-     generation strategy.
-   - Otherwise, `Study` asks the Ax backend to fit a surrogate model on the current data, then
-     hands that model to the `acquisition` layer, which builds and optimizes the custom
-     alpha-blended acquisition function to produce `n_points` candidates.
-4. Caller evaluates the suggested point(s) (outside `boptim`) and calls `study.observe(...)`
-   again with the result(s).
-5. At any point, caller can call `study.predict(...)`, `study.parameterImportance()`,
-   `study.paretoFront`, `study.save(...)`.
+1. Caller constructs a `BayesianOptimizer`, either from a plain list of `Parameter`s (the
+   common case) or from an explicit `SearchSpace` + `Objective` (the case that needs
+   constraints or multi-objective weighting spelled out in full). See section 5.7.
+2. Caller calls `bo.tell(x, y)` zero or more times to inject prior data (FR3).
+3. Caller calls `bo.ask(n_points=..., alpha=...)`.
+   - If `alpha` is left at its default (see 4.3), `BayesianOptimizer` delegates to the Ax
+     backend's default generation strategy.
+   - Otherwise, `BayesianOptimizer` asks the Ax backend to fit a surrogate model on the current
+     data, then hands that model to the `acquisition` layer, which builds and optimizes the
+     custom alpha-blended acquisition function to produce `n_points` candidates.
+4. Caller evaluates the suggested point(s) (outside `boptim`, this is where a real experiment
+   or a training run happens) and calls `bo.tell(x, y)` again with the result(s).
+5. At any point, caller can call `bo.predict(x)`, `bo.parameterImportance()`,
+   `bo.paretoFront`, `bo.save(path)`.
 
 ### 4.3 The exploration/exploitation dial (FR5)
 
@@ -211,13 +215,13 @@ variance. `Objective.weights` controls *preference between objectives*; `alpha` 
 ### 4.4 Handling the full budget range (FR: implicit, from the "4-5 to thousands" requirement)
 
 - The number of purely space-filling initial points (Sobol design) before model-based
-  suggestions start is a configurable parameter of `Study`, defaulting to a small,
+  suggestions start is a configurable parameter of `BayesianOptimizer`, defaulting to a small,
   data-driven heuristic, and can be set to `0` when the caller intends to seed the study
-  entirely through `observe()` and cannot afford to "spend" evaluations on a random design.
+  entirely through `tell()` and cannot afford to "spend" evaluations on a random design.
 - Below a configurable minimum number of observed points (a handful), a full marginal
   likelihood fit of the GP hyperparameters is not reliable; the surrogate model factory falls
   back to fixed/weakly-informative priors on lengthscales and noise rather than free
-  optimization, and `Study` surfaces this state so a caller building a UI on top can show an
+  optimization, and `BayesianOptimizer` surfaces this state so a caller building a UI on top can show an
   explicit "low-confidence model" indicator rather than silently reporting an overconfident
   uncertainty estimate.
 - Scaling to very large budgets (thousands of points, where a plain GP's O(n^3) fitting
@@ -225,7 +229,30 @@ variance. `Objective.weights` controls *preference between objectives*; `alpha` 
   swappable factory function specifically so that a sparse/scalable GP can be plugged in later
   without touching the acquisition or API layers. See section 6.
 
-### 4.5 Key decisions (ADRs)
+### 4.5 Conditional (hierarchical) parameters
+
+Prompted by Keras Tuner's `conditional_scope`/`parent_name` pattern: a parameter that only
+makes sense given another parameter's value (e.g. `num_filters` only matters when
+`model_type == "cnn"`). Kept declarative rather than callback-based (`Parameter.active_when`,
+section 5.2), because a static, inspectable search space is what `persistence/` needs to save
+and reload a study exactly, and what a future GUI would need to render a form that shows or
+hides fields as the user picks values, neither of which is as natural if the space is only
+discovered by actually running a build function the way Keras Tuner's `hp` object is.
+
+Honesty check on the backend: Ax does support this (`HierarchicalSearchSpace`, exposed as a
+`dependents` mapping on a choice parameter), so `active_when` has a real place to map to in
+`backends/ax`. Ax's own team describes the current default behavior as flattening the space
+under the hood for model fitting rather than doing fully tree-aware optimization, noting that
+this "works shockingly well" empirically but is still an active area of their research. Two
+consequences worth being upfront about: (1) the definition, persistence, and introspection of
+a conditional search space is solid and can be built as part of the domain/backend work in
+Phase 1; (2) genuinely exploiting the structure during optimization (rather than just not
+crashing on it) is weaker today than a mature, flat search space, both in Ax's default
+strategy and in `boptim`'s own custom acquisition layer (section 4.3), which does not yet
+reason about `active_when` at all. Treat (1) as a Phase 1/2 item and (2) as a distinct,
+later roadmap item (section 6), not something the `Condition` class alone solves.
+
+### 4.6 Key decisions (ADRs)
 
 Full ADRs live under `docs/adr/`, one file per decision, following the format below. Two are
 written out in full here as the two decisions with the most day-to-day impact; the rest are
@@ -369,29 +396,31 @@ built-in generics).
 boptim/
 ├── pyproject.toml
 ├── README.md
+├── CHANGELOG.md
 ├── mkdocs.yml
 ├── docs/
 │   ├── index.md
 │   ├── contributing.md              # incl. the naming-convention rationale from section 10
-│   └── changelogs
-│       ├── changelog-v0.2.3.md
-│       ├── changelog-v1.0.0.md
-│       └── CHANGELOG.md
+│   ├── changelogs
+│   │   ├── changelog-v0.2.3.md
+│   │   ├── changelog-v1.0.0.md
+│   │   └── CHANGELOG.md
 │   └── adr/
 │       ├── 0001-hybrid-ax-botorch-architecture.md
 │       ├── 0002-uv-over-setuptools.md
 │       ├── 0003-pydantic-domain-models.md
 │       └── 0004-json-persistence-format.md
 ├── src/boptim/
-│   ├── __init__.py                  # re-exports the public surface (Study, parameter
+│   ├── __init__.py                  # re-exports the public surface (BayesianOptimizer, parameter
 │   │                                 # classes, Objective, Metric, constraints, ...)
 │   ├── domain/
 │   │   ├── parameters/
 │   │   │   ├── parameter.py             # Parameter (ABC)
-│   │   │   ├── float_parameter.py       # FloatParameter
-│   │   │   ├── int_parameter.py         # IntParameter
-│   │   │   ├── categorical_parameter.py # CategoricalParameter
-│   │   │   └── boolean_parameter.py     # BooleanParameter
+│   │   │   ├── real.py                  # Real
+│   │   │   ├── integer.py               # Integer
+│   │   │   ├── categorical.py           # Categorical
+│   │   │   ├── boolean.py               # Boolean
+│   │   │   └── condition.py             # Condition (drives active_when, section 5.2)
 │   │   ├── constraints/
 │   │   │   ├── constraint.py            # Constraint (ABC)
 │   │   │   └── linear_constraint.py     # LinearConstraint
@@ -421,14 +450,14 @@ boptim/
 │   │   ├── json_study_repository.py      # JsonStudyRepository
 │   │   └── reproducibility_metadata.py   # ReproducibilityMetadata
 │   ├── api/
-│   │   └── study.py                      # Study (the public facade)
+│   │   └── bayesian_optimizer.py          # BayesianOptimizer (the public facade)
 │   └── logging_config.py                 # configureLogging(...)
 ├── scripts/
 ├── exemples/
 └── tests/
     ├── unit/                             # mirrors src/boptim/*
     └── integration/
-        └── test_end_to_end.py            # dummy objective, full observe/suggest/save/load loop
+        └── test_end_to_end.py            # dummy objective, full tell/ask/save/load loop
 ```
 
 ### 5.2 Domain layer
@@ -439,41 +468,82 @@ class Parameter(ABC):
     """Base class for every kind of search space parameter."""
 
     name: str
+    default: float | int | str | bool | None
+    active_when: Condition | None
+    """None means always active. Set to make this parameter only relevant
+    when another parameter takes specific value(s): a conditional /
+    hierarchical search space, e.g. "num_filters" only matters when
+    "model_type" == "cnn". See section 4.5 for how far this is actually
+    supported end to end."""
 
 
-# domain/parameters/float_parameter.py
-class FloatParameter(Parameter):
+# domain/parameters/condition.py
+class Condition:
+    def __init__(self, parameter_name: str, values: list[float | int | str | bool]) -> None:
+        """True when `parameter_name`'s current value is one of `values`.
+
+        Attach to another Parameter's `active_when` to make it conditional.
+        Named after, and directly inspired by, Keras Tuner's
+        parent_name/parent_values pattern, kept declarative (a plain value
+        object) rather than a callback so the search space stays fully
+        introspectable for persistence and for a future GUI.
+        """
+
+
+# domain/parameters/real.py
+class Real(Parameter):
     def __init__(
         self,
         name: str,
         lower_bound: float,
         upper_bound: float,
         log_scale: bool = False,
+        step: float | None = None,
+        default: float | None = None,
+        active_when: Condition | None = None,
     ) -> None:
-        """A continuous parameter with a lower and upper bound."""
+        """A continuous parameter with a lower and upper bound.
+
+        step, if set, restricts sampling to a fixed grid within the bounds
+        (e.g. a dial that only turns in 5-degree increments).
+        """
 
 
-# domain/parameters/int_parameter.py
-class IntParameter(Parameter):
+# domain/parameters/integer.py
+class Integer(Parameter):
     def __init__(
         self,
         name: str,
         lower_bound: int,
         upper_bound: int,
         log_scale: bool = False,
+        step: int | None = None,
+        default: int | None = None,
+        active_when: Condition | None = None,
     ) -> None:
         """An integer parameter with a lower and upper bound."""
 
 
-# domain/parameters/categorical_parameter.py
-class CategoricalParameter(Parameter):
-    def __init__(self, name: str, categories: list[str]) -> None:
+# domain/parameters/categorical.py
+class Categorical(Parameter):
+    def __init__(
+        self,
+        name: str,
+        categories: list[str],
+        default: str | None = None,
+        active_when: Condition | None = None,
+    ) -> None:
         """A parameter taking one of a fixed, unordered set of values."""
 
 
-# domain/parameters/boolean_parameter.py
-class BooleanParameter(Parameter):
-    def __init__(self, name: str) -> None:
+# domain/parameters/boolean.py
+class Boolean(Parameter):
+    def __init__(
+        self,
+        name: str,
+        default: bool | None = None,
+        active_when: Condition | None = None,
+    ) -> None:
         """A True/False parameter."""
 
 
@@ -533,7 +603,7 @@ class Objective:
         `weights=None` with several metrics means no preference between them
         (a standard Pareto multi-objective problem). Explicit weights scalarize
         the preference between objectives; they do not control exploration
-        versus exploitation, which is `Study.suggest`'s `alpha` (section 4.3).
+        versus exploitation, which is `BayesianOptimizer.ask`'s `alpha` (section 4.3).
         """
 
     @property
@@ -560,7 +630,7 @@ class Trial:
 
 # domain/study_snapshot.py
 class StudySnapshot:
-    """Everything needed to fully reconstruct a Study: its search space,
+    """Everything needed to fully reconstruct a BayesianOptimizer: its search space,
     objective, constraints, trial history, and reproducibility metadata.
     The unit that persistence/ reads and writes."""
 ```
@@ -760,34 +830,65 @@ class ReproducibilityMetadata:
 
 ### 5.7 Public API facade
 
+`ask`/`tell` is the naming used by scikit-optimize and Optuna for exactly this pattern, so it
+was adopted here over the earlier `suggest`/`observe` names for the sake of matching an
+established convention that both target audiences (ML practitioners and, increasingly, the
+BO-literate lab) are likely to already recognize. The constructor accepts either a plain list
+of `Parameter`s (the common case) or a fully-built `SearchSpace`/`Objective` pair (the case
+that needs constraints or multi-objective weighting spelled out), so simple use stays terse
+without losing access to the advanced path.
+
 ```python
-# api/study.py
-class Study:
+# api/bayesian_optimizer.py
+class BayesianOptimizer:
     def __init__(
         self,
-        name: str,
-        search_space: SearchSpace,
-        objective: Objective,
+        parameters: Sequence[Parameter] | SearchSpace,
+        objective: Objective | Literal["minimize", "maximize"] = "minimize",
+        constraints: Sequence[Constraint] | None = None,
+        name: str = "study",
         random_seed: int | None = None,
         backend: OptimizationBackend | None = None,
     ) -> None:
-        """backend defaults to AxBackend(random_seed=random_seed); injectable
-        for testing and for a future non-Ax backend."""
+        """The main entry point. Two ways to call it:
 
-    def observe(
+        Common case: BayesianOptimizer(parameters=[Real(...), Integer(...)]).
+            A single, unnamed metric is assumed; objective="minimize" or
+            "maximize" picks its direction.
+        Advanced case: pass an already-built SearchSpace (carrying its own
+            constraints) and an already-built Objective (named metrics,
+            optional weights, single or multi-objective). `constraints` must
+            be left None in that case (a ValueError is raised otherwise: the
+            SearchSpace already owns its own constraints, so passing both is
+            an ambiguous request, not a merge).
+
+        backend defaults to AxBackend(random_seed=random_seed); injectable for
+        testing and for a future non-Ax backend. The real implementation will
+        likely type this with @overload for the two cases rather than the
+        single Union shown here, kept simple for this spec.
+        """
+
+    def tell(
         self,
-        parameters: dict[str, float | int | str | bool],
-        results: dict[str, float],
-        result_std: dict[str, float] | None = None,
+        x: dict[str, float | int | str | bool],
+        y: dict[str, float],
+        y_std: dict[str, float] | None = None,
     ) -> Trial:
-        """Manually inject an already-known point and its result(s). FR3."""
+        """Manually inject an already-known point and its result(s). FR3.
 
-    def suggest(
+        x maps parameter name to value. y maps metric name to value, matching
+        however Objective's metrics were named (or the single default metric
+        name when the shorthand constructor was used). y_std, when known
+        (e.g. from repeated measurements), is passed through as a fixed
+        observation noise instead of being inferred by the surrogate model.
+        """
+
+    def ask(
         self,
         n_points: int = 1,
         alpha: float | None = None,
     ) -> list[dict[str, float | int | str | bool]]:
-        """Suggest the next n_points parameterizations to evaluate.
+        """Ask for the next n_points parameterizations to evaluate.
 
         Args:
             n_points: batch size requested at once. FR10.
@@ -798,9 +899,7 @@ class Study:
                 custom acquisition layer.
         """
 
-    def predict(
-        self, parameters: dict[str, float | int | str | bool]
-    ) -> PredictionResult:
+    def predict(self, x: dict[str, float | int | str | bool]) -> PredictionResult:
         """FR7, FR8."""
 
     def parameterImportance(self) -> dict[str, dict[str, float]]:
@@ -814,14 +913,67 @@ class Study:
     def paretoFront(self) -> list[Trial]:
         """Recomputed by scanning all trials on each access: has a cost,
         camelCase. Collapses to a single-element list for a single-objective
-        study; `study.paretoFront[0]` is that study's best trial."""
+        optimizer; `bo.paretoFront[0]` is then the best trial found so far."""
 
     def save(self, path: str | Path) -> None:
         """FR11, FR12."""
 
     @classmethod
-    def load(cls, path: str | Path) -> Study:
+    def load(cls, path: str | Path) -> BayesianOptimizer:
         """FR11, FR12."""
+```
+
+### 5.8 Usage example
+
+The common case, start to finish. Parameter and method names are chosen so this reads close
+to plain English, per the "clean but simple" ask that shaped this section.
+
+```python
+from boptim import BayesianOptimizer, Real, Integer, Categorical, Boolean
+
+bo = BayesianOptimizer(
+    parameters=[
+        Real("temperature", 20.0, 120.0),
+        Integer("num_layers", 1, 8),
+        Categorical("solvent", ["water", "ethanol", "toluene"]),
+        Boolean("use_catalyst", default=True),
+    ],
+    objective="maximize",
+)
+
+# seed with a point you already ran, if you have one (FR3)
+bo.tell(
+    {"temperature": 80.0, "num_layers": 3, "solvent": "water", "use_catalyst": True},
+    {"objective": 0.62},
+)
+
+# ask for a single point, leaning toward exploitation
+x = bo.ask(alpha=0.2)[0]
+y = run_my_experiment(**x)          # your own code: a real experiment or a training run
+bo.tell(x, {"objective": y})
+
+# ask for a batch of 3, balanced exploration/exploitation (FR10)
+batch = bo.ask(n_points=3, alpha=0.5)
+
+# what does the model currently believe, with uncertainty? (FR7, FR8)
+prediction = bo.predict({"temperature": 100.0, "num_layers": 4, "solvent": "ethanol", "use_catalyst": False})
+print(prediction.mean, prediction.std)
+
+bo.parameterImportance()            # FR6
+bo.save("study.json")               # FR11, FR12
+bo_reloaded = BayesianOptimizer.load("study.json")
+```
+
+A conditional search space (section 4.5), kept out of the main example above to keep that one
+short:
+
+```python
+model_type = Categorical("model_type", ["mlp", "cnn"])
+bo = BayesianOptimizer(parameters=[
+    model_type,
+    Integer("hidden_units", 8, 512, active_when=Condition("model_type", ["mlp"])),
+    Integer("num_filters", 8, 256, active_when=Condition("model_type", ["cnn"])),
+])
 ```
 
 ---
@@ -833,12 +985,14 @@ requirement from section 2 is in scope, but the genuinely novel part (the alpha 
 built once the foundation under it is solid, rather than the other way around.
 
 **Phase 1: Foundation (domain model + Ax-backed default flow)**
-Full domain model including constraints and multi-objective (`Objective` with N >= 1 metrics
-and optional weights) from the start, since Ax's `Client` natively supports multi-objective,
-constraints, and batch, so this is realistically a mapping-layer effort, not a re-design
-later. `AxBackend`, manual injection, `suggest()` via Ax's own default strategy, `predict()`,
-Ax's built-in sensitivity analysis, JSON persistence and reproducibility metadata.
-Deliverable: a usable, if not yet alpha-controllable, end-to-end loop.
+Full domain model including constraints, multi-objective (`Objective` with N >= 1 metrics and
+optional weights), and `default`/`step`/`active_when` on parameters (FR13, and FR14's
+definition/persistence/introspection side) from the start, since Ax's `Client` natively
+supports multi-objective, constraints, batch, and (per section 4.5) a hierarchical search
+space, so this is realistically a mapping-layer effort, not a re-design later. `AxBackend`,
+manual injection, `ask()` via Ax's own default strategy, `predict()`, Ax's built-in sensitivity
+analysis, JSON persistence and reproducibility metadata. Deliverable: a usable, if not yet
+alpha-controllable, end-to-end loop.
 
 **Phase 2: The exploration/exploitation acquisition layer**
 `ExplorationExploitationAcquisition` and its multi-objective variant, with batch support
@@ -846,16 +1000,19 @@ Deliverable: a usable, if not yet alpha-controllable, end-to-end loop.
 This is FR5, the requirement Ax does not cover, and the reason this project exists rather
 than "just use Ax".
 
-**Phase 3: Robustness across the full budget range**
+**Phase 3: Robustness across the full budget range, and deferred hard problems**
 Weakly-informative-prior fallback for very small trial counts (down to the 4-5-evaluation
-case), explicit low-confidence signaling, and the scalable/sparse-GP extension point in
+case), explicit low-confidence signaling; the scalable/sparse-GP extension point in
 `models/surrogate_model_factory.py` documented (not necessarily implemented) for very large
-trial counts.
+trial counts; and FR14's harder half, making the custom acquisition layer actually reason
+about `active_when` instead of just not breaking on it, documented as a known limitation
+rather than implemented, in step with where Ax's own support for this sits today (section
+4.5).
 
 **Phase 4: Polish, docs, packaging**
 Full `mkdocs` site, ADR-0003 and ADR-0004 written, CI green on lint/type-check/tests,
 `uv`-based packaging finalized, integration test covering the full
-observe/suggest/save/load loop on a dummy objective, and two worked examples in the docs: one
+tell/ask/save/load loop on a dummy objective, and two worked examples in the docs: one
 framed as a physical-experiment campaign, one as an ML hyperparameter search, to make the
 "general-purpose, not lab-specific" intent (section 1.1) concrete rather than just stated.
 
@@ -869,7 +1026,7 @@ of the source template this document extends.)*
 - **Language/runtime:** Python 3.11+
 - **Formatting/linting:** `ruff` (lint + format), consistent import ordering.
 - **Naming convention (custom, overrides PEP8 default for callables):**
-  - Classes -> `CamelCase` (e.g. `SearchSpace`, `FloatParameter`, `ExplorationExploitationAcquisition`).
+  - Classes -> `CamelCase` (e.g. `SearchSpace`, `Real`, `ExplorationExploitationAcquisition`).
   - Variables (including function/method parameters) -> `snake_case` (e.g. `n_points`, `random_seed`).
   - Functions and methods -> same rule as classes but starting lowercase, i.e. `camelCase`
     (e.g. `suggestDefault`, `computeSensitivity`, `buildAcquisitionFunction`), not PEP8's usual
@@ -878,9 +1035,9 @@ of the source template this document extends.)*
   - Properties (`@property`) are named by **cost, not by whether they compute anything**:
     - If accessing the property does real work (recomputes something from the full trial
       history, calls into a model, is not O(1)-ish) -> `camelCase`, exactly like a method,
-      even though it is called without parentheses. Example: `Study.paretoFront`.
+      even though it is called without parentheses. Example: `BayesianOptimizer.paretoFront`.
     - If it just returns an already-stored or negligible-cost value -> `snake_case`, like a
-      variable. Example: `Study.n_trials`, `PredictionResult.std`.
+      variable. Example: `BayesianOptimizer.n_trials`, `PredictionResult.std`.
     - The point is that the caller can tell, from the name alone, whether touching this
       attribute is free or not.
   - Since this deviates from PEP8, disable/adjust `ruff`'s naming rules (`N802`, `N803`,
@@ -891,13 +1048,14 @@ of the source template this document extends.)*
   style rule, not a technical one, so there is no linter for it; review for it like any other
   style note. Same for arrows (`→`), use `->` instead.
 - **Typing:** type hints mandatory everywhere; `mypy --strict` run in CI.
-- **Docstrings:** Google-style, mandatory on every public class/function: purpose, `Args`, `Returns`, `Raises`, `Example`, (`Yield`).
+- **Docstrings:** Google-style, mandatory on every public class/function: purpose, `Args`,
+  `Returns`, `Raises`.
 - **Modularity:** one responsibility per file; one class per file. No god-files: a base class,
   its registry, and every concrete strategy each get their own file (see section 5.1's package
   layout for what this looks like in practice: `parameters/`, `constraints/`, `acquisition/`
   each split this way).
 - **Testing:** `pytest`. Unit tests per module, plus an integration test that runs the full
-  observe/suggest/save/load loop end to end on a dummy objective (shape and gradient sanity
+  tell/ask/save/load loop end to end on a dummy objective (shape and gradient sanity
   checks where tensors are involved).
 - **Logging:** standard `logging` module, no bare `print`.
 - **Version control:** Conventional Commits, semantic versioning, maintained `CHANGELOG.md`.
@@ -918,7 +1076,7 @@ of the source template this document extends.)*
 ## 12. How future Claude conversations (and contributors) should use this document
 
 - Treat sections 0, 2, 3, 5 and 10 as the contract: search-space types, functional
-  requirements, the technology choices and their rationale (section 4.5's ADRs), the package
+  requirements, the technology choices and their rationale (section 4.6's ADRs), the package
   layout, and the naming/style rules. Do not silently deviate from them; propose a change and,
   if accepted, update the relevant ADR or section rather than drifting from it in code.
 - Section 1.4 ("Defaults chosen for this draft") lists the handful of decisions made to keep
