@@ -1,0 +1,119 @@
+[project]
+name = "boptim"
+version = "0.1.0"
+description = "A general-purpose, domain-agnostic Bayesian Optimization library."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "TBD" } # Section 1.4: license is not set for this draft.
+authors = [{ name = "boptim contributors" }]
+keywords = ["bayesian-optimization", "optimization", "machine-learning", "ax", "botorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+
+# Version ranges, not exact pins: exact, mutually-compatible versions belong
+# in the committed `uv.lock` (ADR-0002), not here. `ax-platform` pulls in
+# `botorch`, `gpytorch`, and `torch` transitively; they are still listed
+# explicitly since `backends/ax/AxBackend.py` and `backends/OptimizationBackend.py`
+# import `botorch` directly (ADR-0001), so a resolver failure on that
+# transitive chain should surface as a boptim dependency problem, not a
+# mysterious `ImportError` two layers down.
+dependencies = [
+    "ax-platform>=1.2,<2.0",
+    "botorch>=0.16,<1.0",
+    "gpytorch>=1.14,<2.0",
+    "torch>=2.4",
+    "pydantic>=2.9,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.11",
+    "ruff>=0.6",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocstrings[python]>=0.26",
+    "mkdocs-material>=9.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/CEA-LRVE/boptim"
+Documentation = "https://github.com/CEA-LRVE/boptim/tree/main/docs"
+Changelog = "https://github.com/CEA-LRVE/boptim/blob/main/docs/changelogs/CHANGELOG.md"
+
+# ADR-0002: uv for project/dependency management, uv_build (pure Python, no
+# C extensions to compile) as the build backend rather than setuptools.
+# uv_build tracks uv's own release cadence closely and moves fast (it was
+# already past 0.11 by the time this was written), so this is deliberately
+# an open lower bound rather than a narrow range that a later uv release
+# would fall outside of: run `uv lock --upgrade` after `uv sync` once to let
+# uv.lock pin the exact version your installed `uv` actually resolves.
+[build-system]
+requires = ["uv_build>=0.5,<1.0"]
+build-backend = "uv_build"
+
+# Installed by plain `uv sync` (no --extra needed): the PEP 735 replacement
+# for the old `[tool.uv] dev-dependencies` field, which uv now deprecates in
+# favor of this. `[project.optional-dependencies].dev` (below) is kept too,
+# so `uv sync --extra dev` (as documented in the README) keeps working the
+# same way for anyone who prefers being explicit about it.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.11",
+    "ruff>=0.6",
+]
+
+# --------------------------------------------------------------------------
+# ruff: lint + format. Naming-rule deviations from section 10 (camelCase
+# methods/functions instead of PEP8 snake_case) are deliberately disabled
+# below; see docs/contributing.md for the rationale, so a future contributor
+# does not "helpfully" re-enable them and have ruff silently rewrite the
+# house style back to snake_case.
+# --------------------------------------------------------------------------
+[tool.ruff]
+line-length = 95
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "N802", # function name should be lowercase -> boptim uses camelCase (section 10)
+    "N803", # argument name should be lowercase -> boptim's snake_case arguments are fine;
+             # this also suppresses false positives on camelCase methods' `self`-adjacent args
+    "N806", # variable in function should be lowercase -> local camelCase-named helpers
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["boptim"]
+
+# --------------------------------------------------------------------------
+# mypy --strict (section 1.4, section 10). Third-party stubs for Ax/BoTorch/
+# GPyTorch are incomplete in practice; `ignore_missing_imports` is scoped
+# narrowly to just those packages rather than relaxed globally, so strict
+# checking still applies to all of boptim's own code.
+# --------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["boptim"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["ax.*", "botorch.*", "gpytorch.*", "torch.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=boptim --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["src/boptim"]

@@ -1,0 +1,23 @@
+site_name: boptim
+site_description: A general-purpose, domain-agnostic Bayesian Optimization library for Python.
+docs_dir: docs
+theme:
+  name: material
+  palette:
+    scheme: default
+nav:
+  - Home: index.md
+  - Contributing: contributing.md
+  - Architecture Decisions:
+      - "ADR-0001: Hybrid Ax + BoTorch architecture": adr/0001-hybrid-ax-botorch-architecture.md
+      - "ADR-0002: uv over setuptools": adr/0002-uv-over-setuptools.md
+      - "ADR-0003: Pydantic domain models (to write)": adr/0003-pydantic-domain-models.md
+      - "ADR-0004: JSON persistence format (to write)": adr/0004-json-persistence-format.md
+      - "ADR-0005: Escape hatches to Ax and BoTorch": adr/0005-escape-hatches-to-ax-and-botorch.md
+      - "ADR-0006: NonlinearConstraint forces custom layer": adr/0006-nonlinear-constraint-forces-custom-layer.md
+  - Changelog: changelogs/CHANGELOG.md
+
+# mkdocstrings-based API reference generation (from docstrings, section 3's
+# docs tooling choice) is a Phase 4 deliverable; not wired into `nav` yet in
+# this Phase 1 drop, since much of the package layout that would generate
+# it (acquisition/, models/) is intentionally still empty.

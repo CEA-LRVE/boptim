@@ -1,1 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Environments
 .venv/
+venv/
+
+# uv.lock is deliberately NOT ignored (ADR-0002: committed to version control).
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docs build output
+site/
+
+# OS
+.DS_Store
+
+# Example script output (created by examples/lab_experiment.py)
+reactor_yield_campaign.json
+file_differents.py
