@@ -84,8 +84,10 @@ line-length = 95
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "D1"]
 ignore = [
+    "N999", # invalid module name -> boptim names a file after its one public symbol, so a
+            # class lives in `CamelCase.py` and a function in `camelCase.py` (section 10)
     "N802", # function name should be lowercase -> boptim uses camelCase (section 10)
     "N803", # argument name should be lowercase -> boptim's snake_case arguments are fine;
              # this also suppresses false positives on camelCase methods' `self`-adjacent args
@@ -94,6 +96,15 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["boptim"]
+
+# "D1" only checks that a docstring exists (section 10: mandatory on every public class and
+# function). The Google convention keeps the style rules that would otherwise apply
+# consistent with the docstrings' Google format.
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
 
 # --------------------------------------------------------------------------
 # mypy --strict (section 1.4, section 10). Third-party stubs for Ax/BoTorch/
@@ -110,6 +121,14 @@ mypy_path = "src"
 [[tool.mypy.overrides]]
 module = ["ax.*", "botorch.*", "gpytorch.*", "torch.*"]
 ignore_missing_imports = true
+
+# numpy's own type stubs use Python 3.12 syntax (`type` statements), which mypy rejects while
+# `python_version` is 3.11 (the project's minimum), and that one syntax error stops all
+# checking. boptim does not use numpy directly, so its stubs are skipped rather than parsed.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

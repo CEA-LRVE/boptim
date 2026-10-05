@@ -44,6 +44,16 @@ class Range(Parameter):
         scaling: Literal["linear", "log"] | None = None,
         default: float | int | None = None,
     ) -> None:
+        """Creates a range.
+
+        Args:
+            name: The parameter's name.
+            bounds: The `(lower, upper)` bounds, inclusive.
+            parameter_type: `"float"` or `"int"`.
+            step_size: Optional spacing of the legal values.
+            scaling: `"linear"` (default) or `"log"`.
+            default: Optional default value.
+        """
         super().__init__(
             name=name,
             bounds=bounds,
@@ -54,6 +64,12 @@ class Range(Parameter):
         )
 
     def _validate_default(self) -> None:
+        """Checks the bounds, the log scaling, and the default if there is one.
+
+        Raises:
+            ValueError: if the bounds are empty or inverted, a log range is not strictly
+                positive, or the default is outside the bounds or off the step grid.
+        """
         lower, upper = self.bounds
         if lower >= upper:
             raise ValueError(
@@ -75,9 +91,7 @@ class Range(Parameter):
             )
         if self.step_size is not None and self.step_size > 0:
             steps_from_lower = (value - lower) / self.step_size
-            if not math.isclose(
-                steps_from_lower, round(steps_from_lower), abs_tol=1e-9
-            ):
+            if not math.isclose(steps_from_lower, round(steps_from_lower), abs_tol=1e-9):
                 raise ValueError(
                     f"Range {self.name!r} has default={self.default!r}, which "
                     f"does not land on the step_size={self.step_size!r} grid "
@@ -100,6 +114,11 @@ class Range(Parameter):
         }
 
     def toDict(self) -> dict[str, Any]:
+        """Serializes the parameter.
+
+        Returns:
+            A type-tagged, JSON-compatible form, rebuilt by `parameterFromDict`.
+        """
         return {
             "kind": "range",
             "name": self.name,

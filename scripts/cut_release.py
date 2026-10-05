@@ -23,7 +23,7 @@ CHANGELOG_INDEX_PATH = Path("docs/changelogs/CHANGELOG.md")
 CHANGELOG_DIRECTORY = Path("docs/changelogs")
 
 ENTRY_TEMPLATE = """\
-# v{version} — {date}
+# v{version} ({date})
 
 {summary}
 
@@ -44,6 +44,14 @@ _VERSION_LINE = re.compile(r'^version = "[^"]*"$', re.MULTILINE)
 
 
 def bumpPyprojectVersion(version: str) -> None:
+    """Sets the `version = "..."` line of `pyproject.toml`.
+
+    Args:
+        version: The new version.
+
+    Raises:
+        ValueError: if `pyproject.toml` has no version line.
+    """
     text = PYPROJECT_PATH.read_text(encoding="utf-8")
     new_text, count = _VERSION_LINE.subn(f'version = "{version}"', text, count=1)
     if count == 0:
@@ -52,10 +60,24 @@ def bumpPyprojectVersion(version: str) -> None:
 
 
 def writeChangelogEntry(version: str, summary: str) -> Path:
+    """Writes the immutable changelog entry of a release from the template.
+
+    Args:
+        version: The released version.
+        summary: A one-line summary.
+
+    Returns:
+        The path of the new entry.
+
+    Raises:
+        FileExistsError: if the entry already exists. A released entry is never overwritten.
+    """
     CHANGELOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
     entry_path = CHANGELOG_DIRECTORY / f"changelog-v{version}.md"
     if entry_path.exists():
-        raise FileExistsError(f"{entry_path} already exists; not overwriting a released entry.")
+        raise FileExistsError(
+            f"{entry_path} already exists; not overwriting a released entry."
+        )
     entry_path.write_text(
         ENTRY_TEMPLATE.format(version=version, date=date.today().isoformat(), summary=summary),
         encoding="utf-8",
@@ -64,7 +86,14 @@ def writeChangelogEntry(version: str, summary: str) -> Path:
 
 
 def prependToChangelogIndex(version: str, summary: str) -> None:
-    new_line = f"- [v{version}](./changelog-v{version}.md) — {date.today().isoformat()} — {summary}.\n"
+    """Adds a release to the top of the running changelog index, creating the index if needed.
+
+    Args:
+        version: The released version.
+        summary: A one-line summary.
+    """
+    today = date.today().isoformat()
+    new_line = f"- [v{version}](./changelog-v{version}.md) ({today}): {summary}.\n"
     if not CHANGELOG_INDEX_PATH.exists():
         CHANGELOG_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
         CHANGELOG_INDEX_PATH.write_text(
@@ -74,12 +103,22 @@ def prependToChangelogIndex(version: str, summary: str) -> None:
         )
         return
     lines = CHANGELOG_INDEX_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
-    insert_at = next((i for i, line in enumerate(lines) if line.startswith("- [v")), len(lines))
+    insert_at = next(
+        (i for i, line in enumerate(lines) if line.startswith("- [v")), len(lines)
+    )
     lines.insert(insert_at, new_line)
     CHANGELOG_INDEX_PATH.write_text("".join(lines), encoding="utf-8")
 
 
 def main(argv: list[str]) -> int:
+    """Cuts a release: writes its changelog entry, updates the index, bumps the version.
+
+    Args:
+        argv: The command line: the version, then an optional one-line summary.
+
+    Returns:
+        `0` on success, `2` if no version was given.
+    """
     if len(argv) < 2:
         print(
             'Usage: python scripts/cut_release.py X.Y.Z ["one-line summary"]', file=sys.stderr

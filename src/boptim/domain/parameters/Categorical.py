@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from boptim.domain.parameters.Choice import Choice
+from boptim.domain.parameters.Choice import Choice, ChoiceValue
 
 
 class Categorical(Choice):
@@ -19,11 +19,27 @@ class Categorical(Choice):
         dependent_parameters: Mapping[str, Sequence[str]] | None = None,
         default: str | None = None,
     ) -> None:
+        """Creates a categorical parameter.
+
+        Args:
+            name: The parameter's name.
+            categories: The legal values.
+            dependent_parameters: Optional map from a category to the names of parameters that
+                only exist when it is chosen.
+            default: Optional default category.
+        """
+        # `Mapping` is invariant in its key type, so a Mapping[str, ...] is not a
+        # Mapping[ChoiceValue, ...]: copy it into one.
+        dependents: dict[ChoiceValue, Sequence[str]] | None = (
+            {value: names for value, names in dependent_parameters.items()}
+            if dependent_parameters is not None
+            else None
+        )
         super().__init__(
             name=name,
             values=categories,
             parameter_type="str",
             is_ordered=False,
-            dependent_parameters=dependent_parameters,
+            dependent_parameters=dependents,
             default=default,
         )

@@ -14,7 +14,9 @@ class TestLinearConstraint:
             LinearConstraint({}, bound=1.0, comparator="<=")
 
     def test_unit_coefficients_render_as_bare_names(self) -> None:
-        constraint = LinearConstraint({"a": 1.0, "b": 1.0, "c": 1.0}, bound=1.0, comparator="=")
+        constraint = LinearConstraint(
+            {"a": 1.0, "b": 1.0, "c": 1.0}, bound=1.0, comparator="="
+        )
         assert constraint.toAxParameterConstraintString() == "a + b + c = 1.0"
 
     def test_non_unit_coefficients_render_explicitly(self) -> None:

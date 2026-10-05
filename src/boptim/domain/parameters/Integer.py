@@ -21,6 +21,16 @@ class Integer(Range):
         scaling: Literal["linear", "log"] | None = None,
         default: int | None = None,
     ) -> None:
+        """Creates an integer range.
+
+        Args:
+            name: The parameter's name.
+            min_value: Lower bound, inclusive.
+            max_value: Upper bound, inclusive.
+            step_size: Optional spacing of the legal values.
+            scaling: `"linear"` (default) or `"log"`.
+            default: Optional default value.
+        """
         super().__init__(
             name=name,
             bounds=(float(min_value), float(max_value)),

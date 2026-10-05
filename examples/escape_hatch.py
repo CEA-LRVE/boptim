@@ -37,6 +37,7 @@ def sphere(x: float, y: float) -> float:
 
 
 def main() -> None:
+    """Runs the example: reaches Ax's client and the surrogate model directly (ADR-0005)."""
     configureLogging(level=logging.INFO)
 
     bo = BayesianOptimizer(

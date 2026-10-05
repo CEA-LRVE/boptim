@@ -30,9 +30,7 @@ def toAxOptimizationConfig(objective: Objective) -> tuple[str, list[str]]:
     if len(objective.metrics) == 1:
         objective_string = _signedMetricName(objective.metrics[0])
     elif objective.weights is None:
-        objective_string = ", ".join(
-            _signedMetricName(metric) for metric in objective.metrics
-        )
+        objective_string = ", ".join(_signedMetricName(metric) for metric in objective.metrics)
     else:
         terms = [
             f"{-weight if metric.minimize else weight} * {metric.name}"
@@ -48,4 +46,12 @@ def toAxOptimizationConfig(objective: Objective) -> tuple[str, list[str]]:
 
 
 def _signedMetricName(metric: Metric) -> str:
+    """Names a metric the way Ax's objective strings do: a leading `-` means minimize.
+
+    Args:
+        metric: The metric.
+
+    Returns:
+        `"-name"` if it is minimized, `"name"` otherwise.
+    """
     return f"-{metric.name}" if metric.minimize else metric.name

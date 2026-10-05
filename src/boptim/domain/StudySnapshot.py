@@ -75,6 +75,17 @@ class StudySnapshot(BaseModel):
         backend_state: dict[str, Any],
         backend_kind: str = "ax",
     ) -> None:
+        """Creates a snapshot of a whole study.
+
+        Args:
+            name: The study's name.
+            search_space: The full search space.
+            objective: The full objective.
+            trials: The complete trial history.
+            reproducibility: Seed, library versions and creation time.
+            backend_state: The backend's own serialized state.
+            backend_kind: Which backend `backend_state` belongs to.
+        """
         super().__init__(
             name=name,
             search_space=search_space,

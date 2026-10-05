@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ax.api.client import Client
+from ax.exceptions.core import UnsupportedError
 from botorch.models.model import Model
 
 from boptim.backends.ax.toAxOptimizationConfig import toAxOptimizationConfig
 from boptim.backends.ax.toAxSearchSpace import toAxSearchSpace
 from boptim.backends.OptimizationBackend import OptimizationBackend
+from boptim.backends.PredictionUnavailableError import PredictionUnavailableError
 from boptim.domain.constraints.LinearConstraint import LinearConstraint
 from boptim.domain.Objective import Objective
 from boptim.domain.SearchSpace import SearchSpace
@@ -48,6 +50,18 @@ class AxBackend(OptimizationBackend):
         initialization_budget: int | None = None,
         torch_device: str | None = None,
     ) -> None:
+        """Creates the Ax client; `createExperiment` configures the experiment later.
+
+        Args:
+            random_seed: Seed of the study. A concrete seed is always resolved and
+                recorded, even when left `None`, so that reproducibility metadata never
+                has to say "unknown".
+            method: Ax's generation-strategy preset: `"fast"`, `"quality"` or
+                `"random_search"`.
+            initialization_budget: Number of initial space-filling trials before Ax fits
+                a model. `None` lets Ax choose.
+            torch_device: The torch device Ax's models run on. `None` lets Ax choose.
+        """
         # A concrete seed is always resolved and recorded, even when the
         # caller leaves `random_seed=None`, so ReproducibilityMetadata (FR12)
         # never has to record "unknown". See BayesianOptimizer.__init__.
@@ -74,6 +88,16 @@ class AxBackend(OptimizationBackend):
         self._metric_names: list[str] = []
 
     def createExperiment(self, search_space: SearchSpace, objective: Objective) -> None:
+        """Configures Ax's experiment, optimization goal and generation strategy.
+
+        Only the parameter constraints Ax can enforce are given to it: linear
+        inequalities. An equality or a `NonlinearConstraint` is enforced by boptim's own
+        acquisition layer instead (ADR-0006, ADR-0008).
+
+        Args:
+            search_space: The parameters and parameter constraints.
+            objective: The metrics, weights and outcome constraints.
+        """
         self._search_space = search_space
         self._objective = objective
         self._metric_names = [metric.name for metric in objective.metrics]
@@ -82,7 +106,10 @@ class AxBackend(OptimizationBackend):
         linear_constraint_strings = [
             constraint.toAxParameterConstraintString()
             for constraint in search_space.constraints
+            # Ax takes inequalities only: an equality (and any NonlinearConstraint) is
+            # enforced by boptim's own acquisition layer instead (ADR-0006, ADR-0008).
             if isinstance(constraint, LinearConstraint)
+            and not constraint.requires_custom_acquisition_layer
         ]
         self._client.configure_experiment(
             parameters=ax_parameters,
@@ -131,6 +158,17 @@ class AxBackend(OptimizationBackend):
         return trial_index
 
     def suggestDefault(self, n_points: int) -> list[dict[str, _AxValue]]:
+        """Asks Ax's own generation strategy for the next trials.
+
+        Each suggestion is remembered as pending, so that a later `attachTrial` of the
+        same point completes Ax's running trial rather than creating a second one.
+
+        Args:
+            n_points: Number of trials requested.
+
+        Returns:
+            The suggested parameterizations.
+        """
         next_trials = self._client.get_next_trials(max_trials=n_points)
         suggestions: list[dict[str, _AxValue]] = []
         for trial_index, parameterization in next_trials.items():
@@ -143,40 +181,60 @@ class AxBackend(OptimizationBackend):
         """Best-effort extraction of the BoTorch `Model` currently fitted
         inside Ax's `GenerationStrategy`.
 
-        This walks Ax's internal object graph (`GenerationStrategy` ->
-        `Adapter`/`ModelBridge` -> `Surrogate` -> BoTorch `Model`), which is
-        *not* part of the stable `ax.api` surface this file otherwise
-        restricts itself to. It is deliberately isolated to this one method
-        so that, per ADR-0005's own accepted trade-off ("anything reached
-        through this escape hatch is outside what boptim validates"), a
-        future Ax version needing a different attribute chain only requires
-        editing this one method.
+        This walks Ax's internal object graph (in Ax 1.x: `GenerationStrategy.adapter`
+        -> `.generator` -> `.surrogate` -> `.model`), which is *not* part of the stable
+        `ax.api` surface this file otherwise restricts itself to. It is deliberately
+        isolated to this one method so that, per ADR-0005's own accepted trade-off
+        ("anything reached through this escape hatch is outside what boptim
+        validates"), a future Ax version needing a different attribute chain only
+        requires editing this one method.
+
+        Returns:
+            The fitted BoTorch model, in Ax's own transformed input space.
+
+        Raises:
+            RuntimeError: if no BoTorch model can be reached. While Ax is still in its
+                initial space-filling phase its adapter has no surrogate; the message
+                names the adapter found so that case can be told apart from an Ax
+                version that moved the attributes.
         """
+        adapter: Any = None
         try:
-            generation_strategy = self._client._generation_strategy  # noqa: SLF001
-            adapter = generation_strategy.model
-            surrogate = getattr(adapter, "surrogate", None)
-            model = getattr(surrogate, "model", None) if surrogate is not None else None
-            if model is None:
-                model = getattr(adapter, "model", None)
+            generation_strategy = self._client._generation_strategy
+            adapter = getattr(generation_strategy, "adapter", None)
+            generator = getattr(adapter, "generator", None)
+            surrogate = getattr(generator, "surrogate", None)
+            model = getattr(surrogate, "model", None)
             if not isinstance(model, Model):
                 raise TypeError(
-                    f"resolved object is a {type(model).__name__!r}, not a botorch Model"
+                    f"found {type(model).__name__!r} where a botorch Model belongs"
                 )
             return model
-        except Exception as error:  # noqa: BLE001 - deliberately broad, see docstring
+        except Exception as error:
             raise RuntimeError(
                 "Could not extract a fitted BoTorch model from Ax's current "
-                "GenerationStrategy. This may mean there are not yet enough "
-                "trials for Ax to have fit a model (see `initialization_budget`), "
-                "or that the pinned Ax version restructured its internal "
-                "GenerationStrategy/Adapter/Surrogate object graph, which "
-                "`fitModel()` walks outside of Ax's own `ax.api` stability "
-                "guarantees (ADR-0005)."
+                f"GenerationStrategy (its adapter is a {type(adapter).__name__!r}): {error}. "
+                "This usually means Ax is still in its initial space-filling phase and has "
+                "not fit a model yet (see `initialization_budget`). If a model should exist, "
+                "the pinned Ax version may have restructured the internal "
+                "GenerationStrategy/Adapter/Generator/Surrogate object graph, which "
+                "`fitModel()` walks outside of Ax's own `ax.api` stability guarantees "
+                "(ADR-0005)."
             ) from error
 
     def predict(self, x: dict[str, _AxValue]) -> dict[str, tuple[float, float]]:
-        return self._client.predict([x])[0]
+        """Delegates to `Client.predict`. Until Ax's generation strategy has
+        moved past its initial space-filling phase it holds no model and raises
+        `UnsupportedError`; that is reported as `PredictionUnavailableError` so
+        `BayesianOptimizer.predict` can use boptim's own surrogate instead.
+        """
+        try:
+            return self._client.predict([x])[0]
+        except UnsupportedError as error:
+            raise PredictionUnavailableError(
+                "Ax has no predictive model yet (its generation strategy is still in its "
+                f"initial space-filling phase): {error}"
+            ) from error
 
     def computeSensitivity(self) -> dict[str, dict[str, float]]:
         """Delegates to Ax's own `Client.compute_analyses` with a
@@ -198,7 +256,8 @@ class AxBackend(OptimizationBackend):
             logger.warning(
                 "computeSensitivity() could not import Ax's "
                 "SensitivityAnalysisPlot (its module path may have moved for "
-                "the pinned Ax version): %s", error,
+                "the pinned Ax version): %s",
+                error,
             )
             return {metric_name: {} for metric_name in metric_names}
 
@@ -210,18 +269,25 @@ class AxBackend(OptimizationBackend):
                     display=False,
                 )
                 result[metric_name] = _extractParameterImportance(cards)
-            except Exception as error:  # noqa: BLE001 - see docstring
+            except Exception as error:
                 logger.warning(
-                    "computeSensitivity() could not extract sensitivity for "
-                    "metric %r: %s", metric_name, error,
+                    "computeSensitivity() could not extract sensitivity for metric %r: %s",
+                    metric_name,
+                    error,
                 )
                 result[metric_name] = {}
         return result
 
     def getParetoFrontier(self) -> list[Trial]:
+        """The Pareto frontier according to Ax, using model predictions.
+
+        Returns:
+            The frontier as trials, or an empty list (with a logged warning) if Ax cannot
+            compute it, for instance while there are too few trials.
+        """
         try:
             entries = self._client.get_pareto_frontier(use_model_predictions=True)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("getParetoFrontier() failed: %s", error)
             return []
         return [
@@ -230,16 +296,28 @@ class AxBackend(OptimizationBackend):
         ]
 
     def getBestTrial(self) -> Trial | None:
+        """The best parameterization according to Ax, using model predictions.
+
+        Returns:
+            The best trial, or `None` (with a logged warning) if Ax cannot name one yet.
+        """
         try:
             parameters, means, trial_index, _arm_name = self._client.get_best_parameterization(
                 use_model_predictions=True
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("getBestTrial() failed (no completed trials yet?): %s", error)
             return None
         return _axBestEntryToTrial(parameters, means, trial_index)
 
     def exportState(self) -> dict[str, Any]:
+        """Serializes the whole Ax client.
+
+        Ax only offers a file-based save, so this saves to a temporary file and reads it back.
+
+        Returns:
+            The JSON-compatible state `Client.save_to_json_file` writes.
+        """
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir) / "ax_client_snapshot.json"
             self._client.save_to_json_file(str(tmp_path))
@@ -247,6 +325,15 @@ class AxBackend(OptimizationBackend):
 
     @classmethod
     def importState(cls, state: dict[str, Any]) -> AxBackend:
+        """Rebuilds a backend from state produced by `exportState`.
+
+        Args:
+            state: The state `exportState` returned.
+
+        Returns:
+            A backend whose Ax client holds the saved experiment and trials. Its metric
+            names are read back from the Ax experiment.
+        """
         backend = cls()
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir) / "ax_client_snapshot.json"
@@ -262,12 +349,18 @@ class AxBackend(OptimizationBackend):
         by the caller and this backend only has the raw Ax state to go on).
         """
         try:
-            optimization_config = self._client._experiment.optimization_config  # noqa: SLF001
-            return list(optimization_config.metrics.keys())
-        except Exception as error:  # noqa: BLE001
+            optimization_config = self._client._experiment.optimization_config
+            if optimization_config is None:
+                raise ValueError("The Ax experiment has no optimization config yet.")
+            # The objective's own metrics, not `optimization_config.metrics` (which
+            # Ax 1.x does not have): this matches what `createExperiment` records
+            # from boptim's `Objective`, for single, multi and weighted objectives.
+            return list(optimization_config.objective.metric_names)
+        except Exception as error:
             logger.warning(
                 "Could not resolve metric names from the Ax experiment; "
-                "computeSensitivity() will return an empty result: %s", error,
+                "computeSensitivity() will return an empty result: %s",
+                error,
             )
             return []
 
@@ -284,12 +377,29 @@ class AxBackend(OptimizationBackend):
 def _canonicalParameters(
     parameters: Mapping[str, _AxValue],
 ) -> tuple[tuple[str, _AxValue], ...]:
+    """Turns a parameterization into a hashable, order-independent key.
+
+    Args:
+        parameters: Parameter name to value.
+
+    Returns:
+        The `(name, value)` pairs sorted by name.
+    """
     return tuple(sorted(parameters.items()))
 
 
 def _toAxRawData(
     results: dict[str, float], result_std: dict[str, float] | None
 ) -> dict[str, _AxRawDataValue]:
+    """Builds the `raw_data` Ax expects for a completed trial.
+
+    Args:
+        results: Metric name to observed value.
+        result_std: Metric name to the known standard deviation of that observation, if any.
+
+    Returns:
+        Metric name to a mean, or to a `(mean, sem)` pair where a deviation is known.
+    """
     raw_data: dict[str, _AxRawDataValue] = {}
     for name, mean in results.items():
         if result_std is not None and name in result_std:
@@ -300,6 +410,14 @@ def _toAxRawData(
 
 
 def _meanAndSem(value: float | tuple[float, float]) -> tuple[float, float | None]:
+    """Splits an Ax metric value into its mean and its standard error.
+
+    Args:
+        value: A plain mean, or a `(mean, sem)` pair.
+
+    Returns:
+        `(mean, sem)`, with `sem` being `None` when only a mean was given.
+    """
     if isinstance(value, tuple):
         return value[0], value[1]
     return value, None
@@ -310,6 +428,16 @@ def _axBestEntryToTrial(
     means: Mapping[str, float | tuple[float, float]],
     trial_index: int,
 ) -> Trial:
+    """Converts one entry of Ax's best-parameterization or Pareto output into a `Trial`.
+
+    Args:
+        parameters: The parameterization.
+        means: Metric name to a mean, or a `(mean, sem)` pair.
+        trial_index: The Ax trial index.
+
+    Returns:
+        The trial, with `result_std` set only where Ax gave a standard error.
+    """
     results: dict[str, float] = {}
     result_std: dict[str, float] = {}
     for metric_name, value in means.items():

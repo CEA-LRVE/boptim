@@ -6,15 +6,15 @@ from typing import Any
 
 from boptim.domain.constraints.Constraint import Constraint
 from boptim.domain.constraints.LinearConstraint import LinearConstraint
+from boptim.domain.constraints.NonlinearConstraint import NonlinearConstraint
 
 
 def constraintFromDict(data: dict[str, Any]) -> Constraint:
     """The inverse of `Constraint.toDict`.
 
-    Only `LinearConstraint` exists in Phase 1. Phase 2 adds
-    `NonlinearConstraint` (FR17, ADR-0006): it must be added to this
-    dispatcher in the same change, or a study using one could be saved but
-    not reloaded.
+    Handles `LinearConstraint` and `NonlinearConstraint` (FR17, ADR-0006). A
+    new `Constraint` subclass must be added to this dispatcher in the same
+    change, or a study using one could be saved but not reloaded.
 
     Raises:
         ValueError: if `data["kind"]` is missing or unknown.
@@ -26,7 +26,12 @@ def constraintFromDict(data: dict[str, Any]) -> Constraint:
             bound=data["bound"],
             comparator=data["comparator"],
         )
+    if kind == "nonlinear":
+        return NonlinearConstraint(
+            expression=data["expression"],
+            comparator=data["comparator"],
+            bound=data["bound"],
+        )
     raise ValueError(
-        f"Cannot rebuild a Constraint from kind={kind!r}; expected 'linear' "
-        "(NonlinearConstraint arrives in Phase 2)."
+        f"Cannot rebuild a Constraint from kind={kind!r}; expected 'linear' or 'nonlinear'."
     )

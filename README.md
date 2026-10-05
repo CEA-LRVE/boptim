@@ -10,9 +10,10 @@ evaluations, without the caller having to pre-classify which case they are in. S
 
 ## Status
 
-**Phase 1 of 4 (Foundation)** — see the [roadmap](./PROJECT_SPECIFICATION.md#6-roadmap).
+**Phase 2 of 4 (the exploration/exploitation acquisition layer)**: see the
+[roadmap](./PROJECT_SPECIFICATION.md#6-roadmap).
 
-This drop implements:
+Phase 1 implemented:
 
 - The full domain model: `Range`/`Real`/`Integer`, `Choice`/`Categorical`/`Boolean`/`Fixed`/
   `Derived` (with `dependent_parameters`, FR14's definition side), `LinearConstraint` (FR9),
@@ -24,22 +25,33 @@ This drop implements:
 - `JsonStudyRepository`: save/load a study to/from a single JSON file, with reproducibility
   metadata (FR11, FR12).
 
-**Not yet implemented** (Phase 2 onward): the `alpha`-controlled exploration/exploitation
-acquisition layer (FR5) — `ask(alpha=...)` currently raises `NotImplementedError` — and
-`NonlinearConstraint` (FR17). See `PROJECT_SPECIFICATION.md` section 6.
+Phase 2 adds:
 
-> **Verification status.** Written against Ax's current API reference
-> (<https://ax.readthedocs.io/en/stable/api.html>), but **never run against the real
-> `pydantic` / `ax-platform` / `botorch`**: the authoring sandbox blocks PyPI
-> (`host_not_allowed`). What *was* done: `python -m py_compile` on every file, the
-> naming-convention script, and a run of the whole test suite (104 tests), both examples and
-> an ask/tell/save/load check against throwaway stand-ins for Pydantic, pytest and Ax's
-> `Client` (kept outside this repo). That exercises the Python logic of this code, **not**
-> Pydantic's or Ax's real behaviour. Still unverified: Pydantic v2 semantics (custom
-> `__init__` + validators/serializers, union matching, the stdlib dataclass inside
-> `StudySnapshot`), Ax's real `Client` behaviour (`AxBackend.fitModel` and
-> `.computeSensitivity` walk non-`ax.api` internals), `mypy --strict` and `ruff`.
-> Next step: `uv sync --extra dev && uv run pytest && uv run mypy && uv run ruff check .`
+- `ask(n_points=..., alpha=...)` (FR5, FR10): boptim's own acquisition layer, a blend of
+  exploitation and exploration weighted by `alpha`, with batches chosen sequentially. It fits
+  its own surrogate model from the trial history (ADR-0007) and handles log scales, integer
+  grids, ordered and categorical choices, and conditional parameters.
+- `NonlinearConstraint` (FR17), e.g. `NonlinearConstraint("var * x ** z", "<=", 50.0)`, written
+  as an expression string so a study still saves and reloads. Ax cannot enforce it, so
+  `ask()` with no `alpha` switches to the custom layer and logs a warning (ADR-0006). The same
+  goes for an equality `LinearConstraint` such as a mixture summing to one, which Ax cannot
+  enforce either (ADR-0008).
+- `predict()` works from the second trial on: it uses boptim's own surrogate while Ax, still in
+  its initial space-filling phase, has no model yet.
+
+Known limits of the custom layer in this phase: it does not enforce `OutcomeConstraint`s (a
+warning is logged), it rejects `LinearConstraint`s on log-scaled parameters, and its
+`alpha` has not been tuned: on the problems measured so far the best value is
+problem-dependent and Ax's own default (`ask()` without `alpha`) is a strong baseline. See
+ADR-0006 for the numbers. **Not yet implemented** (Phase 3 onward): the small-sample
+robustness work and an acquisition layer that reasons about `dependent_parameters`. See
+`PROJECT_SPECIFICATION.md` section 6.
+
+> **Verification status.** Run against the locked versions of the real libraries
+> (`pydantic` 2.13.5, `ax-platform` 1.3.1, `botorch` 0.18.1, `torch` 2.14.0): all 425 tests pass
+> (399 unit, 26 integration), and `ruff check`, `ruff format --check`, `mypy` (strict) and
+> `scripts/check_naming_convention.py` all pass. `ruff` also enforces that every public class,
+> method and function has a docstring (see `docs/contributing.md`).
 
 ## Install
 
@@ -82,7 +94,9 @@ y = run_my_experiment(**x)  # your own code: a real experiment or a training run
 bo.tell(x, {"objective": y})
 
 # what does the model currently believe, with uncertainty? (FR7, FR8)
-prediction = bo.predict({"temperature": 100.0, "num_layers": 4, "solvent": "ethanol", "use_catalyst": False})
+prediction = bo.predict(
+    {"temperature": 100.0, "num_layers": 4, "solvent": "ethanol", "use_catalyst": False}
+)
 print(prediction.mean, prediction.sem)
 
 bo.parameterImportance()  # FR6
@@ -90,10 +104,21 @@ bo.save("study.json")  # FR11, FR12
 bo_reloaded = BayesianOptimizer.load("study.json")
 ```
 
-See [`examples/`](./examples) for two complete, runnable scripts:
+Pass `alpha` to choose the exploration/exploitation trade-off yourself (`0.0` favors the best
+predicted point, `1.0` the least-known region), and `n_points` for a batch:
+
+```python
+batch = bo.ask(n_points=3, alpha=0.3)
+```
+
+See [`examples/`](./examples) for complete, runnable scripts:
 [`lab_experiment.py`](./examples/lab_experiment.py) (a small-budget, high-cost-per-evaluation
-campaign, seeded via `tell()`) and [`escape_hatch.py`](./examples/escape_hatch.py)
-(`axClient`/`fitModel()` used directly, ADR-0005).
+campaign, seeded via `tell()`), [`escape_hatch.py`](./examples/escape_hatch.py)
+(`axClient`/`fitModel()` used directly, ADR-0005),
+[`ml_hyperparameter_search.py`](./examples/ml_hyperparameter_search.py) (batches, a mixed
+and conditional search space, `alpha` per round) and
+[`nonlinear_constraint.py`](./examples/nonlinear_constraint.py) (`NonlinearConstraint` and the
+automatic switch, ADR-0006).
 
 ## Development
 

@@ -46,6 +46,17 @@ class Choice(Parameter):
         dependent_parameters: Mapping[ChoiceValue, Sequence[str]] | None = None,
         default: ChoiceValue | None = None,
     ) -> None:
+        """Creates a discrete parameter.
+
+        Args:
+            name: The parameter's name.
+            values: The legal values.
+            parameter_type: The Python type of `values`' elements.
+            is_ordered: Whether the values have a meaningful order; `None` leaves it to Ax.
+            dependent_parameters: Optional map from a value to the names of parameters
+                that only exist when it is chosen.
+            default: Optional default value.
+        """
         super().__init__(
             name=name,
             values=values,
@@ -56,6 +67,12 @@ class Choice(Parameter):
         )
 
     def _validate_default(self) -> None:
+        """Checks the values are usable and the default, if any, is one of them.
+
+        Raises:
+            ValueError: if `values` is empty or has duplicates, `dependent_parameters` is keyed
+                on a value not in `values`, or the default is not one of the values.
+        """
         if not self.values:
             raise ValueError(f"Choice {self.name!r} was given an empty `values` list.")
         if len(set(self.values)) != len(self.values):

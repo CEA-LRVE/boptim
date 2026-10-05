@@ -52,7 +52,7 @@ capability, which is a worse outcome for a library meant to be "accessible to al
 
 1. [x] Add `axClient` and `fitModel()` to `BayesianOptimizer` in the same change that
    implements `AxBackend` (Phase 1).
-2. [ ] Document at least one worked example of each in `examples/` — `axClient` is covered by
+2. [ ] Document at least one worked example of each in `examples/`. `axClient` is covered by
    `examples/escape_hatch.py` (Phase 1); `fitModel()`'s more interesting worked example (a
    caller writing their own acquisition function against it) is more natural once Phase 2's
    `acquisition/` layer exists to contrast it with, so it is deferred there. `examples/

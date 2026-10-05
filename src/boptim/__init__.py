@@ -10,12 +10,22 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
+from boptim.acquisition.AcquisitionStrategy import AcquisitionStrategy
+from boptim.acquisition.AlphaAcquisitionStrategy import AlphaAcquisitionStrategy
+from boptim.acquisition.ExplorationExploitationAcquisition import (
+    ExplorationExploitationAcquisition,
+)
+from boptim.acquisition.MultiObjectiveExplorationExploitationAcquisition import (
+    MultiObjectiveExplorationExploitationAcquisition,
+)
 from boptim.analysis.PredictionResult import PredictionResult
 from boptim.api.BayesianOptimizer import BayesianOptimizer
 from boptim.backends.ax.AxBackend import AxBackend
 from boptim.backends.OptimizationBackend import OptimizationBackend
+from boptim.backends.PredictionUnavailableError import PredictionUnavailableError
 from boptim.domain.constraints.Constraint import Constraint
 from boptim.domain.constraints.LinearConstraint import LinearConstraint
+from boptim.domain.constraints.NonlinearConstraint import NonlinearConstraint
 from boptim.domain.Metric import Metric
 from boptim.domain.Objective import Objective
 from boptim.domain.OutcomeConstraint import OutcomeConstraint
@@ -44,6 +54,8 @@ except PackageNotFoundError:  # running from a source checkout without install
     __version__ = "0.0.0+unknown"
 
 __all__ = [
+    "AcquisitionStrategy",
+    "AlphaAcquisitionStrategy",
     "AxBackend",
     "BayesianOptimizer",
     "Boolean",
@@ -51,16 +63,20 @@ __all__ = [
     "Choice",
     "Constraint",
     "Derived",
+    "ExplorationExploitationAcquisition",
     "Fixed",
     "Integer",
     "JsonStudyRepository",
     "LinearConstraint",
     "Metric",
+    "MultiObjectiveExplorationExploitationAcquisition",
+    "NonlinearConstraint",
     "Objective",
     "OptimizationBackend",
     "OutcomeConstraint",
     "Parameter",
     "PredictionResult",
+    "PredictionUnavailableError",
     "Range",
     "Real",
     "ReproducibilityMetadata",

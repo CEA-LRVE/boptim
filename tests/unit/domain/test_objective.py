@@ -15,7 +15,10 @@ class TestObjective:
 
     def test_several_metrics_is_multi_objective(self) -> None:
         objective = Objective(
-            metrics=[Metric(name="cost", minimize=True), Metric(name="quality", minimize=False)]
+            metrics=[
+                Metric(name="cost", minimize=True),
+                Metric(name="quality", minimize=False),
+            ]
         )
         assert objective.is_multi_objective is True
 
@@ -25,18 +28,29 @@ class TestObjective:
 
     def test_rejects_duplicate_metric_names(self) -> None:
         with pytest.raises(ValidationError, match="duplicate"):
-            Objective(metrics=[Metric(name="loss", minimize=True), Metric(name="loss", minimize=False)])
+            Objective(
+                metrics=[
+                    Metric(name="loss", minimize=True),
+                    Metric(name="loss", minimize=False),
+                ]
+            )
 
     def test_weights_must_match_metric_count(self) -> None:
         with pytest.raises(ValidationError, match="weight"):
             Objective(
-                metrics=[Metric(name="cost", minimize=True), Metric(name="quality", minimize=False)],
+                metrics=[
+                    Metric(name="cost", minimize=True),
+                    Metric(name="quality", minimize=False),
+                ],
                 weights=[1.0],
             )
 
     def test_matching_weights_are_accepted(self) -> None:
         objective = Objective(
-            metrics=[Metric(name="cost", minimize=True), Metric(name="quality", minimize=False)],
+            metrics=[
+                Metric(name="cost", minimize=True),
+                Metric(name="quality", minimize=False),
+            ],
             weights=[2.0, 1.0],
         )
         assert objective.weights == [2.0, 1.0]

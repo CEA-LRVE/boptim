@@ -20,4 +20,10 @@ class Metric(BaseModel):
     minimize: bool
 
     def __init__(self, name: str, minimize: bool) -> None:
+        """Creates a metric.
+
+        Args:
+            name: The metric's name.
+            minimize: `True` to minimize this metric, `False` to maximize it.
+        """
         super().__init__(name=name, minimize=minimize)

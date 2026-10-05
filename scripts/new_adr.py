@@ -56,12 +56,28 @@ TEMPLATE = """\
 
 
 def slugify(title: str) -> str:
+    """Turns a title into a lowercase, hyphen-separated file name fragment.
+
+    Args:
+        title: The decision's title.
+
+    Returns:
+        The slug, for example `"use ax"` gives `"use-ax"`.
+    """
     lowered = title.strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
     return slug
 
 
 def nextAdrNumber(adr_directory: Path) -> int:
+    """Finds the next free ADR number.
+
+    Args:
+        adr_directory: The directory holding the `NNNN-*.md` records.
+
+    Returns:
+        One more than the highest existing number, or `1` if there are none.
+    """
     highest = 0
     for path in adr_directory.glob("[0-9][0-9][0-9][0-9]-*.md"):
         highest = max(highest, int(path.name[:4]))
@@ -69,6 +85,14 @@ def nextAdrNumber(adr_directory: Path) -> int:
 
 
 def main(argv: list[str]) -> int:
+    """Creates the next numbered ADR file from the template.
+
+    Args:
+        argv: The command line: the decision's title.
+
+    Returns:
+        `0` on success, `1` if the file already exists, `2` on a usage error.
+    """
     if len(argv) != 2:
         print('Usage: python scripts/new_adr.py "Some short decision title"', file=sys.stderr)
         return 2

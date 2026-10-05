@@ -38,6 +38,19 @@ class Parameter(BaseModel, ABC):
     # `True` is not read as an int, `int` before `float` so `3` stays `3`.
     default: bool | int | float | str | None = None
 
+    def __init__(self, **data: Any) -> None:
+        """Validates and stores the fields of a concrete parameter.
+
+        Declared explicitly so that type checkers accept the keyword arguments each
+        concrete subclass forwards from its own constructor (`bounds`, `values`, ...):
+        without it they only know the base class's own fields, `name` and `default`.
+        Pydantic still validates everything at runtime.
+
+        Args:
+            **data: The fields of the concrete subclass, as keyword arguments.
+        """
+        super().__init__(**data)
+
     @abstractmethod
     def toDict(self) -> dict[str, Any]:
         """Explicit, type-tagged, JSON-compatible form of this parameter.
@@ -65,5 +78,10 @@ class Parameter(BaseModel, ABC):
 
     @model_validator(mode="after")
     def _run_default_validation(self) -> Parameter:
+        """Runs the subclass's `_validate_default` once the fields are set.
+
+        Returns:
+            The parameter itself.
+        """
         self._validate_default()
         return self

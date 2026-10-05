@@ -56,7 +56,10 @@ class TestChoiceRoundTrip:
         assert type(reloaded) is Choice
         assert reloaded.values == ["mlp", "cnn"]
         assert reloaded.is_ordered is False
-        assert reloaded.dependent_parameters == {"mlp": ["hidden_units"], "cnn": ["num_filters"]}
+        assert reloaded.dependent_parameters == {
+            "mlp": ["hidden_units"],
+            "cnn": ["num_filters"],
+        }
         assert reloaded.default == "mlp"
 
     def test_non_string_dependent_keys_keep_their_type(self) -> None:

@@ -1,6 +1,6 @@
 # ADR-0006: `NonlinearConstraint` forces the custom acquisition layer, with a warning
 
-**Status:** Accepted (implementation deferred to Phase 2)
+**Status:** Accepted (implemented in Phase 2)
 **Date:** 2026-09-23
 **Deciders:** [project owner]
 
@@ -49,18 +49,31 @@ promise a `NonlinearConstraint` itself makes (returned candidates satisfy it).
 
 ## Action items
 
-1. [ ] Implement the search-space check and the forced switch in `BayesianOptimizer.ask()`,
+1. [x] Implement the search-space check and the forced switch in `BayesianOptimizer.ask()`,
    Phase 2, alongside the custom acquisition layer it depends on.
-2. [ ] Add a test asserting the warning fires exactly when `alpha=None` and a
-   `NonlinearConstraint` is present, and never otherwise.
-3. [ ] Add `examples/nonlinear_constraint.py` demonstrating both the constraint and the switch.
+2. [x] Add a test asserting the warning fires exactly when `alpha=None` and a
+   `NonlinearConstraint` is present, and never otherwise
+   (`tests/unit/api/test_bayesian_optimizer.py::TestNonlinearConstraintSwitch`).
+3. [x] Add `examples/nonlinear_constraint.py` demonstrating both the constraint and the switch.
+4. [ ] Revisit `DEFAULT_ALPHA_WHEN_FORCED = 0.0` with the Phase 2 evidence below.
 
-## Phase 1 status
+## Phase 2 status and evidence on the forced default
 
-`NonlinearConstraint` does not exist yet (it is deferred to Phase 2 alongside the acquisition
-layer that is the only thing able to enforce it — see `domain/constraints/__init__.py`'s own
-docstring), so this ADR's switch has nothing to trigger on yet. In this Phase 1 drop,
-`BayesianOptimizer.ask(alpha=...)` raises `NotImplementedError` for *any* non-`None` `alpha`,
-unconditionally: the distinction this ADR draws (explicit `alpha` vs. an implicit,
-constraint-triggered switch) only becomes meaningful once both `alpha` and
-`NonlinearConstraint` are real, in Phase 2.
+Implemented as decided. The one thing the implementation measured that bears on the decision
+is the value of the forced default. On a toy problem (maximize `x + y` subject to
+`x * y ** 2 <= 50`, 10 evaluations, 6 seeds, true optimum 12.24), pure exploitation often
+stalls, re-suggesting an already-evaluated point because the posterior-mean maximum sits on it:
+
+| `alpha` | mean best | runs reaching the optimum | mean repeated suggestions per run |
+|---|---|---|---|
+| 0.0 | 10.93 | 2 / 6 | 0.8 |
+| 0.1 | 10.95 | 3 / 6 | 2.0 |
+| 0.3 | 12.24 | 6 / 6 | 2.7 |
+| 0.5 | 12.24 | 6 / 6 | 0.2 |
+
+On a different problem (a 6-dimensional mixed search space, no nonlinear constraint, 18
+evaluations, 4 seeds) `alpha = 0.0` was the best setting and larger values were worse
+(`alpha=0.0`: 0.344, `0.1`: 0.450, `0.3`: 0.498, Ax default: 0.333; optimum about 0.25). So
+the best value is problem-dependent and small samples were used; this is evidence to weigh,
+not a recommendation to change the constant. It is a named constant precisely so that it is
+easy to revisit.

@@ -37,13 +37,38 @@ class LinearConstraint(Constraint):
         bound: float,
         comparator: Literal["<=", ">=", "="],
     ) -> None:
+        """Creates a linear constraint.
+
+        Args:
+            coefficients: Parameter name to its coefficient in the sum.
+            bound: The right-hand side.
+            comparator: `"<="`, `">="` or `"="`.
+        """
         super().__init__(coefficients=coefficients, bound=bound, comparator=comparator)
 
     @model_validator(mode="after")
     def _validateNotEmpty(self) -> LinearConstraint:
+        """Checks the constraint involves at least one parameter.
+
+        Returns:
+            The constraint itself.
+
+        Raises:
+            ValueError: if there are no coefficients.
+        """
         if not self.coefficients:
             raise ValueError("LinearConstraint requires at least one coefficient.")
         return self
+
+    @property
+    def requires_custom_acquisition_layer(self) -> bool:
+        """`True` for the `"="` comparator: Ax's `parameter_constraints` accept
+        inequalities only (it rejects `"a + b = 1"`, and encoding an equality as
+        two inequalities leaves a zero-volume region its candidate generator can
+        never sample). `boptim`'s own acquisition layer enforces equalities
+        exactly (ADR-0008).
+        """
+        return self.comparator == "="
 
     def toAxParameterConstraintString(self) -> str:
         """Renders this constraint as the string
@@ -63,6 +88,11 @@ class LinearConstraint(Constraint):
         return f"{left_hand_side} {self.comparator} {self.bound}"
 
     def toDict(self) -> dict[str, Any]:
+        """Serializes the constraint.
+
+        Returns:
+            A type-tagged, JSON-compatible form, rebuilt by `constraintFromDict`.
+        """
         return {
             "kind": "linear",
             "coefficients": dict(self.coefficients),

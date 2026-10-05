@@ -25,6 +25,16 @@ class Real(Range):
         scaling: Literal["linear", "log"] | None = None,
         default: float | None = None,
     ) -> None:
+        """Creates a real-valued range.
+
+        Args:
+            name: The parameter's name.
+            min_value: Lower bound, inclusive.
+            max_value: Upper bound, inclusive.
+            step_size: Optional spacing of the legal values.
+            scaling: `"linear"` (default) or `"log"`.
+            default: Optional default value.
+        """
         super().__init__(
             name=name,
             bounds=(min_value, max_value),

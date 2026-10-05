@@ -10,9 +10,9 @@ Demonstrates:
   on a random, space-filling design; the study is seeded entirely through
   `tell()` instead.
 - Manual injection of prior data via `tell()` (FR3).
-- `ask()` using Ax's own no-manual-tuning default strategy (FR4). Phase 2 adds
-  `alpha`-controlled exploration/exploitation (FR5); this Phase 1 drop only has
-  the default path, so `ask()` is called here with no `alpha` argument.
+- `ask()` using Ax's own no-manual-tuning default strategy (FR4), called here with
+  no `alpha` argument. See `ml_hyperparameter_search.py` for `alpha`-controlled
+  exploration/exploitation (FR5).
 - `predict()` with calibrated uncertainty (FR7, FR8).
 - `parameterImportance()` (FR6).
 - `save()`/`load()` (FR11, FR12).
@@ -24,6 +24,7 @@ Run with:
 from __future__ import annotations
 
 import logging
+import os
 
 from boptim import AxBackend, BayesianOptimizer, Categorical, Real
 from boptim.logging_config import configureLogging
@@ -52,6 +53,7 @@ def runReactorExperiment(temperature: float, pressure: float, catalyst: str) -> 
 
 
 def main() -> None:
+    """Runs the example: a small-budget campaign seeded with prior data through `tell()`."""
     configureLogging(level=logging.INFO)
 
     # A custom AxBackend, injected rather than left as BayesianOptimizer's own
@@ -90,7 +92,9 @@ def main() -> None:
 
     observed_yield = runReactorExperiment(**next_point)  # a real experiment, in practice
     recorded_trial = bo.tell(next_point, {"objective": observed_yield})
-    print(f"Recorded trial #{recorded_trial.trial_index}: observed yield = {observed_yield:.3f}")
+    print(
+        f"Recorded trial #{recorded_trial.trial_index}: observed yield = {observed_yield:.3f}"
+    )
 
     # What does the model now believe about a point we have not run? (FR7, FR8)
     candidate = {"temperature": 250.0, "pressure": 7.0, "catalyst": "C"}
@@ -106,12 +110,16 @@ def main() -> None:
     # raising, so the rest of the script still runs.
     print(f"Parameter importance: {bo.parameterImportance()}")
 
-    output_path = "reactor_yield_campaign.json"
+    output_dir = os.path.join(os.path.split(__file__)[0], "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_path = os.path.join(output_dir, "reactor_yield_campaign.json")
     bo.save(output_path)
     print(f"Saved to {output_path}")
 
     reloaded = BayesianOptimizer.load(output_path)
-    print(f"Reloaded study with {reloaded.n_trials} trial(s) and {len(reloaded.paretoFront)} best trial(s).")
+    n_best = len(reloaded.paretoFront)
+    print(f"Reloaded study with {reloaded.n_trials} trial(s) and {n_best} best trial(s).")
 
 
 if __name__ == "__main__":

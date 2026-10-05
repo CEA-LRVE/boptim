@@ -43,6 +43,14 @@ class OutcomeConstraint(BaseModel):
         comparator: Literal["<=", ">="],
         relative: bool = False,
     ) -> None:
+        """Creates a constraint on an observed metric.
+
+        Args:
+            metric_name: The name of the constrained metric.
+            bound: The right-hand side of the (in)equality.
+            comparator: `"<="` or `">="`.
+            relative: Whether `bound` is a multiple of a baseline trial rather than absolute.
+        """
         super().__init__(
             metric_name=metric_name, bound=bound, comparator=comparator, relative=relative
         )

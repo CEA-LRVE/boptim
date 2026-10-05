@@ -26,7 +26,10 @@ class TestSingleObjective:
 class TestUnweightedMultiObjective:
     def test_renders_a_comma_separated_pareto_objective(self) -> None:
         objective = Objective(
-            metrics=[Metric(name="cost", minimize=True), Metric(name="quality", minimize=False)]
+            metrics=[
+                Metric(name="cost", minimize=True),
+                Metric(name="quality", minimize=False),
+            ]
         )
         objective_string, _ = toAxOptimizationConfig(objective)
         assert objective_string == "-cost, quality"
@@ -35,7 +38,10 @@ class TestUnweightedMultiObjective:
 class TestWeightedMultiObjective:
     def test_renders_a_scalarized_weighted_sum(self) -> None:
         objective = Objective(
-            metrics=[Metric(name="cost", minimize=True), Metric(name="quality", minimize=False)],
+            metrics=[
+                Metric(name="cost", minimize=True),
+                Metric(name="quality", minimize=False),
+            ],
             weights=[2.0, 1.0],
         )
         objective_string, _ = toAxOptimizationConfig(objective)

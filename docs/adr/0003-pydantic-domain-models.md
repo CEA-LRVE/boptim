@@ -10,7 +10,7 @@ Design philosophy #2 (`PROJECT_SPECIFICATION.md` section 1.3): "`boptim`'s publi
 own, but it is not a cage." Ax and BoTorch are implementation details behind an adapter for
 the common case, not something a caller has to understand to get started, and Ax's own public
 API surface has already changed once (the move to `ax.api.client.Client`/`ax.api.configs`
-this specification itself was revised to track — see the note at the top of
+this specification itself was revised to track; see the note at the top of
 `PROJECT_SPECIFICATION.md`). A domain layer with zero ML dependencies (section 4.1) is what
 lets `boptim`'s public surface stay stable even if the backend underneath it changes.
 

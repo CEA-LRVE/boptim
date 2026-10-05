@@ -37,6 +37,13 @@ class Objective(BaseModel):
         weights: Sequence[float] | None = None,
         outcome_constraints: Sequence[OutcomeConstraint] | None = None,
     ) -> None:
+        """Creates an objective from metrics, optional weights and outcome constraints.
+
+        Args:
+            metrics: The metrics, at least one.
+            weights: Optional preference weights, one per metric.
+            outcome_constraints: Optional constraints on the metrics.
+        """
         super().__init__(
             metrics=list(metrics),
             weights=list(weights) if weights is not None else None,
@@ -47,6 +54,16 @@ class Objective(BaseModel):
 
     @model_validator(mode="after")
     def _validateShape(self) -> Objective:
+        """Checks the objective is coherent.
+
+        Returns:
+            The objective itself.
+
+        Raises:
+            ValueError: if there is no metric, metric names repeat, the weight count
+                differs from the metric count, or a constraint names a metric the
+                objective does not have.
+        """
         if not self.metrics:
             raise ValueError("Objective requires at least one Metric.")
         names = [metric.name for metric in self.metrics]

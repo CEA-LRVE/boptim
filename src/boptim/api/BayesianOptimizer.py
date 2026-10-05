@@ -8,10 +8,15 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
+from boptim.acquisition.AcquisitionStrategy import AcquisitionStrategy
+from boptim.acquisition.AlphaAcquisitionStrategy import AlphaAcquisitionStrategy
 from boptim.analysis.PredictionResult import PredictionResult
 from boptim.backends.ax.AxBackend import AxBackend
 from boptim.backends.OptimizationBackend import OptimizationBackend
+from boptim.backends.PredictionUnavailableError import PredictionUnavailableError
 from boptim.domain.constraints.Constraint import Constraint
+from boptim.domain.constraints.LinearConstraint import LinearConstraint
+from boptim.domain.constraints.NonlinearConstraint import NonlinearConstraint
 from boptim.domain.Metric import Metric
 from boptim.domain.Objective import Objective
 from boptim.domain.OutcomeConstraint import OutcomeConstraint
@@ -19,6 +24,10 @@ from boptim.domain.parameters.Parameter import Parameter
 from boptim.domain.SearchSpace import SearchSpace
 from boptim.domain.StudySnapshot import StudySnapshot
 from boptim.domain.Trial import Trial
+from boptim.models.buildSurrogateModel import buildSurrogateModel
+from boptim.models.encodeTrials import encodeTrials
+from boptim.models.predictWithModel import predictWithModel
+from boptim.models.SearchSpaceEncoder import SearchSpaceEncoder
 from boptim.persistence.JsonStudyRepository import JsonStudyRepository
 from boptim.persistence.ReproducibilityMetadata import ReproducibilityMetadata
 
@@ -34,6 +43,18 @@ logger = logging.getLogger(__name__)
 #: Matches section 5.8's usage example (`bo.tell(x, {"objective": 0.62})`)
 #: exactly.
 IMPLICIT_METRIC_NAME = "objective"
+
+#: The `alpha` used when a `NonlinearConstraint` forces `ask()` onto the custom
+#: acquisition layer although the caller left `alpha` at `None` (ADR-0006).
+#: Pure exploitation: with no opinion expressed, go for the best predicted
+#: point that satisfies the constraint.
+DEFAULT_ALPHA_WHEN_FORCED = 0.0
+
+#: Number of completed trials below which the custom acquisition layer cannot
+#: fit a surrogate model and suggests space-filling points instead.
+MIN_TRIALS_FOR_MODEL = 2
+
+_MAX_SEED = 2**31 - 1
 
 
 class BayesianOptimizer:
@@ -58,7 +79,10 @@ class BayesianOptimizer:
     what a mixed call was supposed to mean.
 
     `backend` defaults to `AxBackend(random_seed=random_seed)`; injectable
-    for testing and for a future non-Ax backend.
+    for testing and for a future non-Ax backend. `acquisition_strategy`
+    defaults to `AlphaAcquisitionStrategy()`, the layer behind `ask(alpha=...)`;
+    injectable to change how candidates are chosen from the surrogate model
+    (FR16).
     """
 
     @overload
@@ -71,6 +95,7 @@ class BayesianOptimizer:
         name: str = "study",
         random_seed: int | None = None,
         backend: OptimizationBackend | None = None,
+        acquisition_strategy: AcquisitionStrategy | None = None,
     ) -> None: ...
 
     @overload
@@ -83,6 +108,7 @@ class BayesianOptimizer:
         name: str = "study",
         random_seed: int | None = None,
         backend: OptimizationBackend | None = None,
+        acquisition_strategy: AcquisitionStrategy | None = None,
     ) -> None: ...
 
     def __init__(
@@ -94,12 +120,41 @@ class BayesianOptimizer:
         name: str = "study",
         random_seed: int | None = None,
         backend: OptimizationBackend | None = None,
+        acquisition_strategy: AcquisitionStrategy | None = None,
     ) -> None:
+        """Creates the study and configures the backend.
+
+        Args:
+            parameters: A sequence of parameters (common case) or an already-built
+                `SearchSpace` (advanced case).
+            objective: `"minimize"` or `"maximize"` for the implicit single metric
+                (common case), or an already-built `Objective` (advanced case).
+            constraints: Parameter constraints (common case only).
+            outcome_constraints: Constraints on the implicit metric (common case only).
+            name: The study's name.
+            random_seed: Seed recorded in the reproducibility metadata and given to the default
+                backend. A concrete seed is generated and recorded when left `None`.
+            backend: The optimization backend. Defaults to an `AxBackend`.
+            acquisition_strategy: How candidates are chosen from the surrogate model when
+                `ask()` is given an `alpha`. Defaults to an `AlphaAcquisitionStrategy`.
+
+        Raises:
+            ValueError: if constraints are passed together with a `SearchSpace`/`Objective`, or
+                `objective` is a string other than `"minimize"`/`"maximize"`.
+            TypeError: if `parameters` and `objective` are combined in an unsupported way.
+        """
         self._search_space, self._objective = _resolveSearchSpaceAndObjective(
             parameters, objective, constraints, outcome_constraints
         )
         self._name = name
         self._trials: list[Trial] = []
+        self._acquisition_strategy: AcquisitionStrategy = (
+            acquisition_strategy
+            if acquisition_strategy is not None
+            else AlphaAcquisitionStrategy()
+        )
+        self._asks_since_tell = 0
+        self._own_model_cache: tuple[int, Model] | None = None
 
         self._random_seed = (
             random_seed if random_seed is not None else secrets.randbelow(2**31 - 1)
@@ -157,6 +212,7 @@ class BayesianOptimizer:
             trial_index=trial_index,
         )
         self._trials.append(recorded_trial)
+        self._asks_since_tell = 0
         return recorded_trial
 
     def ask(
@@ -166,40 +222,93 @@ class BayesianOptimizer:
     ) -> list[dict[str, float | int | str | bool]]:
         """Ask for the next `n_points` parameterizations to evaluate.
 
+        With `alpha=None` (the default), the backend's own no-manual-tuning
+        strategy chooses (FR4). With `alpha` set, boptim's own acquisition layer
+        chooses instead (FR5): it fits a surrogate model on the trial history
+        and maximizes a blend of exploitation and exploration weighted by
+        `alpha`. Batches (`n_points > 1`) are built one point at a time, each
+        chosen point treated as already pending when picking the next (FR10).
+
+        The effective strategy also depends on the search space: if it holds a
+        `NonlinearConstraint`, which Ax cannot enforce, then `alpha=None` does
+        NOT use Ax's strategy. `ask()` switches to the custom layer with
+        `DEFAULT_ALPHA_WHEN_FORCED` (`0.0`, pure exploitation) and logs a
+        warning saying so (ADR-0006). Passing `alpha` explicitly never warns.
+
+        With fewer than `MIN_TRIALS_FOR_MODEL` completed trials there is no model
+        to consult, so the custom layer suggests space-filling points (that
+        still satisfy every constraint).
+
+        The custom layer does not track points it has suggested but that were
+        not yet told: asking twice with no `tell()` in between yields different
+        points, but not points chosen to complement each other. Ask for a
+        batch instead.
+
+        Every suggested point satisfies the search space's parameter
+        constraints. `OutcomeConstraint`s are not yet enforced by the custom
+        layer: a warning is logged when there are some.
+
         Args:
             n_points: batch size requested at once. FR10.
             alpha: exploration/exploitation trade-off in `[0, 1]`. `0.0`
                 favors the best predicted objective, `1.0` favors the
                 least-known region, `0.5` balances both. FR5. If `None`,
                 delegates to the backend's own no-manual-tuning default
-                strategy (FR4).
+                strategy (FR4), except as described above.
+
+        Returns:
+            `n_points` parameterizations, each a dict from parameter name to
+            value, ready to pass to `tell()` once evaluated.
 
         Raises:
-            ValueError: if `n_points < 1`.
-            NotImplementedError: if `alpha` is not `None`. The custom
-                BoTorch acquisition layer that implements FR5 (and, with it,
-                the `NonlinearConstraint`-triggered automatic switch of
-                ADR-0006) is Phase 2 of the roadmap (section 6); this Phase 1
-                drop implements FR4's default path only, and says so clearly
-                here rather than silently ignoring `alpha` or returning
-                candidates that do not actually reflect it.
+            ValueError: if `n_points < 1` or `alpha` is outside `[0, 1]`.
         """
         if n_points < 1:
             raise ValueError(f"n_points must be >= 1; got {n_points!r}.")
-        if alpha is not None:
-            raise NotImplementedError(
-                "alpha-controlled acquisition (FR5) is not implemented in this "
-                "Phase 1 drop: the custom BoTorch acquisition layer it depends "
-                "on lands in Phase 2 (ADR-0001, roadmap section 6). Call "
-                "ask() with alpha=None (the default) to use the Ax backend's "
-                "own no-manual-tuning default generation strategy (FR4), which "
-                "is fully implemented."
+        if alpha is not None and not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"alpha must be in [0, 1]; got {alpha!r}.")
+
+        forcing = self._constraintsForcingCustomLayer()
+        if alpha is None and forcing:
+            logger.warning(
+                "The search space has %s, which Ax's default generation strategy cannot "
+                "enforce: ask() is switching to boptim's own acquisition layer with "
+                "alpha=%s (DEFAULT_ALPHA_WHEN_FORCED, pure exploitation). Pass alpha "
+                "explicitly to choose the trade-off yourself and silence this warning.",
+                " and ".join(forcing),
+                DEFAULT_ALPHA_WHEN_FORCED,
             )
-        return self._backend.suggestDefault(n_points)
+            alpha = DEFAULT_ALPHA_WHEN_FORCED
+
+        if alpha is None:
+            return self._backend.suggestDefault(n_points)
+        return self._askWithAlpha(n_points, alpha)
 
     def predict(self, x: dict[str, float | int | str | bool]) -> PredictionResult:
-        """FR7, FR8."""
-        raw_prediction = self._backend.predict(dict(x))
+        """The model's belief about `x`: predicted mean and standard error of
+        the mean per metric, in the metrics' own units. FR7, FR8.
+
+        Uses the backend's own model when it has one. Early in a study it does
+        not (Ax's generation strategy only builds a model after its initial
+        space-filling phase), so in that case boptim fits its own surrogate model
+        to the trial history instead (ADR-0007); that is also the model
+        `ask(alpha=...)` uses. Either way the numbers carry the same meaning.
+
+        Args:
+            x: A parameterization (parameter name to value). Parameters that
+                `dependent_parameters` switch off may be left out.
+
+        Returns:
+            The prediction.
+
+        Raises:
+            PredictionUnavailableError: if no model can be fit yet, because
+                fewer than `MIN_TRIALS_FOR_MODEL` trials have been told.
+        """
+        try:
+            raw_prediction = self._backend.predict(dict(x))
+        except PredictionUnavailableError:
+            raw_prediction = self._predictWithOwnModel(x)
         mean = {name: mean_sem[0] for name, mean_sem in raw_prediction.items()}
         sem = {name: mean_sem[1] for name, mean_sem in raw_prediction.items()}
         return PredictionResult(mean=mean, sem=sem)
@@ -265,8 +374,98 @@ class BayesianOptimizer:
         instance._trials = list(snapshot.trials)
         instance._reproducibility = snapshot.reproducibility
         instance._random_seed = snapshot.reproducibility.random_seed
+        instance._acquisition_strategy = AlphaAcquisitionStrategy()
+        instance._asks_since_tell = 0
+        instance._own_model_cache = None
         instance._backend = AxBackend.importState(snapshot.backend_state)
         return instance
+
+    def _predictWithOwnModel(
+        self, x: dict[str, float | int | str | bool]
+    ) -> dict[str, tuple[float, float]]:
+        """`predict()` for when the backend has no model: boptim's own surrogate,
+        refit only when the trial history has changed since the last call.
+        """
+        if self.n_trials < MIN_TRIALS_FOR_MODEL:
+            raise PredictionUnavailableError(
+                f"predict() needs at least {MIN_TRIALS_FOR_MODEL} completed trials to fit a "
+                f"model; {self.n_trials} told so far."
+            )
+        encoder = SearchSpaceEncoder(self._search_space)
+        if self._own_model_cache is None or self._own_model_cache[0] != self.n_trials:
+            logger.info(
+                "The backend has no predictive model yet: predicting with boptim's own "
+                "surrogate model, fit on %d trial(s).",
+                self.n_trials,
+            )
+            train_x, train_y, train_yvar = encodeTrials(encoder, self._objective, self._trials)
+            self._own_model_cache = (
+                self.n_trials,
+                buildSurrogateModel(train_x, train_y, train_yvar),
+            )
+        return predictWithModel(
+            self._own_model_cache[1],
+            encoder.encodeParameters(x),
+            [metric.name for metric in self._objective.metrics],
+        )
+
+    def _constraintsForcingCustomLayer(self) -> list[str]:
+        """Names the kinds of constraint in the search space that only boptim's
+        own acquisition layer can enforce (empty when Ax can enforce them all).
+        """
+        labels: list[str] = []
+        for constraint in self._search_space.constraints:
+            if not constraint.requires_custom_acquisition_layer:
+                continue
+            label = (
+                "a NonlinearConstraint"
+                if isinstance(constraint, NonlinearConstraint)
+                else "an equality LinearConstraint"
+                if isinstance(constraint, LinearConstraint)
+                else f"a {type(constraint).__name__}"
+            )
+            if label not in labels:
+                labels.append(label)
+        return labels
+
+    def _askWithAlpha(
+        self, n_points: int, alpha: float
+    ) -> list[dict[str, float | int | str | bool]]:
+        """The custom acquisition layer's path through `ask()`. Independent of
+        the backend: the surrogate is fit from boptim's own trial history
+        (ADR-0007), not taken from Ax.
+        """
+        # Deterministic given the study's seed and history, and different for
+        # successive asks between two tells.
+        seed = (
+            self._random_seed + 1_000_003 * self.n_trials + self._asks_since_tell
+        ) % _MAX_SEED
+        self._asks_since_tell += 1
+
+        if self._objective.outcome_constraints:
+            logger.warning(
+                "The custom acquisition layer does not enforce OutcomeConstraints yet: "
+                "the suggested points respect the parameter constraints but may not "
+                "satisfy %d outcome constraint(s). Use alpha=None to have Ax enforce them.",
+                len(self._objective.outcome_constraints),
+            )
+        if self.n_trials < MIN_TRIALS_FOR_MODEL:
+            logger.info(
+                "Only %d completed trial(s) (< %d): suggesting space-filling points instead "
+                "of consulting a surrogate model.",
+                self.n_trials,
+                MIN_TRIALS_FOR_MODEL,
+            )
+            return self._acquisition_strategy.suggestSpaceFilling(
+                self._search_space, n_points, seed=seed
+            )
+
+        encoder = SearchSpaceEncoder(self._search_space)
+        train_x, train_y, train_yvar = encodeTrials(encoder, self._objective, self._trials)
+        model = buildSurrogateModel(train_x, train_y, train_yvar)
+        return self._acquisition_strategy.suggest(
+            model, self._objective, self._search_space, alpha, n_points, seed=seed
+        )
 
     @property
     def axClient(self) -> Any:
@@ -289,12 +488,17 @@ class BayesianOptimizer:
         return self._backend.client
 
     def fitModel(self) -> Model:
-        """Escape hatch (FR16, ADR-0005): fits and returns the current
-        BoTorch surrogate model directly (the same one `acquisition/` builds
-        on, from Phase 2 onward), so a caller can write and optimize their
-        own acquisition function with plain BoTorch and feed the result back
+        """Escape hatch (FR16, ADR-0005): the BoTorch surrogate model Ax
+        currently holds, so a caller can write and optimize their own
+        acquisition function with plain BoTorch and feed the result back
         through `tell()`, without forking boptim to get an acquisition
         behavior the alpha dial does not cover.
+
+        This is Ax's model, in Ax's own transformed input space, and it only
+        exists once Ax has left its initial space-filling phase. It is not the
+        model `ask(alpha=...)` uses: the alpha layer fits its own from boptim's
+        trial history in the unit-cube encoding of `SearchSpaceEncoder`
+        (ADR-0007).
         """
         return self._backend.fitModel()
 
@@ -305,10 +509,23 @@ def _resolveSearchSpaceAndObjective(
     constraints: Sequence[Constraint] | None,
     outcome_constraints: Sequence[OutcomeConstraint] | None,
 ) -> tuple[SearchSpace, Objective]:
-    is_search_space = isinstance(parameters, SearchSpace)
-    is_objective = isinstance(objective, Objective)
+    """Turns the constructor's two call shapes into a `SearchSpace` and an `Objective`.
 
-    if is_search_space and is_objective:
+    Args:
+        parameters: A parameter sequence or a `SearchSpace`.
+        objective: `"minimize"`/`"maximize"` or an `Objective`.
+        constraints: Parameter constraints, accepted only with a parameter sequence.
+        outcome_constraints: Metric constraints, accepted only with a parameter sequence.
+
+    Returns:
+        The `(search_space, objective)` pair.
+
+    Raises:
+        ValueError: if constraints accompany a `SearchSpace`/`Objective`, or the objective
+            string is not `"minimize"`/`"maximize"`.
+        TypeError: for any other combination of `parameters` and `objective`.
+    """
+    if isinstance(parameters, SearchSpace) and isinstance(objective, Objective):
         if constraints is not None or outcome_constraints is not None:
             raise ValueError(
                 "When `parameters` is a SearchSpace and `objective` is an "
@@ -319,7 +536,7 @@ def _resolveSearchSpaceAndObjective(
             )
         return parameters, objective
 
-    if not is_search_space and not is_objective:
+    if not isinstance(parameters, SearchSpace) and not isinstance(objective, Objective):
         if objective not in ("minimize", "maximize"):
             raise ValueError(
                 "objective must be 'minimize' or 'maximize' when "
@@ -337,6 +554,8 @@ def _resolveSearchSpaceAndObjective(
         )
         return search_space, implicit_objective
 
+    is_search_space = isinstance(parameters, SearchSpace)
+    is_objective = isinstance(objective, Objective)
     raise TypeError(
         "BayesianOptimizer() takes either (parameters=Sequence[Parameter], "
         "objective='minimize'|'maximize') for the common case, or "
@@ -349,6 +568,17 @@ def _resolveSearchSpaceAndObjective(
 
 
 def _backendKind(backend: OptimizationBackend) -> str:
+    """Names the kind of a backend for persistence.
+
+    Args:
+        backend: The backend to describe.
+
+    Returns:
+        `"ax"` for an `AxBackend`.
+
+    Raises:
+        TypeError: for any other backend, which cannot be saved yet.
+    """
     if isinstance(backend, AxBackend):
         return "ax"
     raise TypeError(

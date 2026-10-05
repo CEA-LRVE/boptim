@@ -11,6 +11,12 @@ class Boolean(Choice):
     """
 
     def __init__(self, name: str, default: bool | None = None) -> None:
+        """Creates a boolean parameter.
+
+        Args:
+            name: The parameter's name.
+            default: Optional default value.
+        """
         super().__init__(
             name=name,
             values=[True, False],

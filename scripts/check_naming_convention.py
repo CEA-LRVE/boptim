@@ -31,10 +31,20 @@ from pathlib import Path
 EXEMPT_FILE_NAMES = frozenset({"__init__.py", "conftest.py", "logging_config.py"})
 
 #: Directories never scanned: virtual envs, caches, build artifacts.
-EXCLUDED_DIR_NAMES = frozenset({
-    ".venv", "venv", "__pycache__", ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "build", "dist", "site",
-})
+EXCLUDED_DIR_NAMES = frozenset(
+    {
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "build",
+        "dist",
+        "site",
+    }
+)
 
 
 def findTopLevelPublicSymbolNames(source: str) -> list[str]:
@@ -44,9 +54,9 @@ def findTopLevelPublicSymbolNames(source: str) -> list[str]:
     tree = ast.parse(source)
     names: list[str] = []
     for node in tree.body:
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            if not node.name.startswith("_"):
-                names.append(node.name)
+        is_definition = isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        if is_definition and not node.name.startswith("_"):
+            names.append(node.name)
     return names
 
 
@@ -69,6 +79,14 @@ def checkFile(path: Path) -> str | None:
 
 
 def findPythonFiles(root: Path) -> list[Path]:
+    """Lists the Python files under `root`, skipping caches and virtual environments.
+
+    Args:
+        root: The directory to search.
+
+    Returns:
+        The files, sorted.
+    """
     return sorted(
         p
         for p in root.rglob("*.py")
@@ -77,6 +95,15 @@ def findPythonFiles(root: Path) -> list[Path]:
 
 
 def main(argv: list[str]) -> int:
+    """Checks every Python file under a directory against the naming convention.
+
+    Args:
+        argv: The command line; an optional second item is the directory (default `src`).
+
+    Returns:
+        `0` if every file follows the convention, `1` if any violates it, `2` if the directory
+        does not exist.
+    """
     root = Path(argv[1]) if len(argv) > 1 else Path("src")
     if not root.exists():
         print(f"check_naming_convention: root {root} does not exist", file=sys.stderr)

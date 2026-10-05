@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, cast
 
 from ax.core.parameter import ChoiceParameter, DerivedParameter, FixedParameter, RangeParameter
 from ax.core.parameter import ParameterType as AxParameterType
@@ -14,7 +14,7 @@ from boptim.domain.parameters.Parameter import Parameter
 from boptim.domain.parameters.Range import Range
 from boptim.domain.SearchSpace import SearchSpace
 
-_AX_TO_BOPTIM_TYPE: dict[AxParameterType, str] = {
+_AX_TO_BOPTIM_TYPE: dict[AxParameterType, Literal["float", "int", "str", "bool"]] = {
     AxParameterType.FLOAT: "float",
     AxParameterType.INT: "int",
     AxParameterType.STRING: "str",
@@ -52,28 +52,49 @@ def fromAxSearchSpace(ax_parameters: list[Any]) -> SearchSpace:
 
 
 def _fromAxParameter(ax_parameter: Any) -> Parameter:
+    """Converts one Ax core parameter into the matching boptim `Parameter`.
+
+    Args:
+        ax_parameter: An Ax `RangeParameter`, `FixedParameter`, `ChoiceParameter` or
+            `DerivedParameter`.
+
+    Returns:
+        The boptim parameter.
+
+    Raises:
+        ValueError: if a fixed or choice parameter has no value, or a range has a string or
+            bool type.
+        TypeError: for any other kind of Ax parameter.
+    """
     if isinstance(ax_parameter, RangeParameter):
         return Range(
             name=ax_parameter.name,
             bounds=(float(ax_parameter.lower), float(ax_parameter.upper)),
-            parameter_type=_axTypeToBoptim(ax_parameter.parameter_type, allow_str_bool=False),  # type: ignore[arg-type]
+            parameter_type=_axRangeType(ax_parameter.parameter_type),
             step_size=getattr(ax_parameter, "step_size", None),
             scaling="log" if getattr(ax_parameter, "log_scale", False) else None,
         )
     if isinstance(ax_parameter, FixedParameter):
+        if ax_parameter.value is None:
+            raise ValueError(f"Ax FixedParameter {ax_parameter.name!r} has no value.")
         return Fixed(name=ax_parameter.name, value=ax_parameter.value)
     if isinstance(ax_parameter, ChoiceParameter):
+        if any(value is None for value in ax_parameter.values):
+            raise ValueError(f"Ax ChoiceParameter {ax_parameter.name!r} has a None value.")
         return Choice(
             name=ax_parameter.name,
-            values=list(ax_parameter.values),
-            parameter_type=_axTypeToBoptim(ax_parameter.parameter_type, allow_str_bool=True),  # type: ignore[arg-type]
+            # Ax types its values as one mixed list; a Choice holds a homogeneous one.
+            values=cast(
+                "list[int] | list[float] | list[str] | list[bool]", ax_parameter.values
+            ),
+            parameter_type=_axChoiceType(ax_parameter.parameter_type),
             is_ordered=ax_parameter.is_ordered,
         )
     if isinstance(ax_parameter, DerivedParameter):
         return Derived(
             name=ax_parameter.name,
             expression=ax_parameter.expression_str,
-            parameter_type=_axTypeToBoptim(ax_parameter.parameter_type, allow_str_bool=True),  # type: ignore[arg-type]
+            parameter_type=_axChoiceType(ax_parameter.parameter_type),
         )
     raise TypeError(
         f"No boptim Parameter mapping is defined for Ax parameter kind "
@@ -81,11 +102,36 @@ def _fromAxParameter(ax_parameter: Any) -> Parameter:
     )
 
 
-def _axTypeToBoptim(ax_type: AxParameterType, *, allow_str_bool: bool) -> str:
+def _axChoiceType(ax_type: AxParameterType) -> Literal["float", "int", "str", "bool"]:
+    """Maps an Ax parameter type to the boptim type name used by `Choice` and `Derived`.
+
+    Args:
+        ax_type: The Ax parameter type.
+
+    Returns:
+        `"float"`, `"int"`, `"str"` or `"bool"`.
+    """
+    return _AX_TO_BOPTIM_TYPE[ax_type]
+
+
+def _axRangeType(ax_type: AxParameterType) -> Literal["float", "int"]:
+    """Maps an Ax parameter type to the boptim type name used by `Range`.
+
+    Args:
+        ax_type: The Ax parameter type.
+
+    Returns:
+        `"float"` or `"int"`.
+
+    Raises:
+        ValueError: if the type is a string or a bool, which a `Range` cannot hold.
+    """
     boptim_type = _AX_TO_BOPTIM_TYPE[ax_type]
-    if not allow_str_bool and boptim_type not in ("float", "int"):
-        raise ValueError(
-            f"Ax RangeParameter reported parameter_type={ax_type!r}, which has "
-            f"no float/int boptim Range equivalent."
-        )
-    return boptim_type
+    if boptim_type == "float":
+        return "float"
+    if boptim_type == "int":
+        return "int"
+    raise ValueError(
+        f"Ax RangeParameter reported parameter_type={ax_type!r}, which has "
+        "no float/int boptim Range equivalent."
+    )

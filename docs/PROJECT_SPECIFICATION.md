@@ -179,9 +179,13 @@ api/  BayesianOptimizer                     <- the single public entry point
 3. Caller calls `bo.ask(n_points=..., alpha=...)`.
    - If `alpha` is left at its default (see 4.3), `BayesianOptimizer` delegates to the Ax
      backend's default generation strategy.
-   - Otherwise, `BayesianOptimizer` asks the Ax backend to fit a surrogate model on the current
-     data, then hands that model to the `acquisition` layer, which builds and optimizes the
-     custom alpha-blended acquisition function to produce `n_points` candidates.
+   - Otherwise, `BayesianOptimizer` fits a surrogate model on its own trial history (in the
+     unit-cube encoding of `models/SearchSpaceEncoder`, ADR-0007), then hands that model to
+     the `acquisition` layer, which builds and optimizes the custom alpha-blended acquisition
+     function to produce `n_points` candidates. With fewer than two completed trials there is
+     nothing to fit, so space-filling points are suggested instead.
+   - The same path is taken with `alpha` left at its default when the search space holds a
+     `NonlinearConstraint` (section 4.6, ADR-0006).
 4. Caller evaluates the suggested point(s) (outside `boptim`, this is where a real experiment
    or a training run happens) and calls `bo.tell(x, y)` again with the result(s).
 5. At any point, caller can call `bo.predict(x)`, `bo.parameterImportance()`,
@@ -212,22 +216,41 @@ candidate point `x`:
   Expected Improvement, which already blends in some uncertainty-seeking behavior; keeping the
   two extremes clean (mean-only vs. variance-only) is what makes `alpha` behave the way the
   original spec describes it.
-- **Exploration term:** the posterior predictive variance at `x` (the same quantity
+- **Exploration term:** the posterior variance of the underlying function at `x` (the
+  epistemic uncertainty, without observation noise: the same quantity
   `qNegIntegratedPosteriorVariance` integrates over the search space), normalized the same
   way.
 
 The blended score is `score(x) = (1 - alpha) * exploitation(x) + alpha * exploration(x)`,
-maximized by BoTorch's standard `optimize_acqf`. For a batch of `n_points > 1`, points are
-chosen sequentially using BoTorch's fantasization mechanism (each already-chosen point in the
-batch is treated as a pending, model-predicted observation before picking the next one), which
-is BoTorch's standard way of getting a diverse batch instead of `n_points` copies of the same
-optimum.
+maximized by BoTorch's `optimize_acqf`. For a batch of `n_points > 1`, points are chosen
+sequentially: each already-chosen point is passed back to the acquisition function as pending
+before the next is optimized. Pending points enter the two terms differently, because a GP
+treats them differently:
 
-For multi-objective studies, the same blend applies, but the exploitation term becomes a
-(weighted, if `Objective.weights` is set) hypervolume-improvement-style term over the current
-Pareto front, and the exploration term becomes an aggregate of the per-objective posterior
-variance. `Objective.weights` controls *preference between objectives*; `alpha` controls
+- The exploration term is computed on a fantasy model conditioned on the pending points
+  (BoTorch's `fantasize`). A GP's posterior variance does not depend on the observed values, so
+  one fantasy suffices and the variance around a pending point collapses as if observed.
+- A mean-only exploitation term cannot be diversified that way: conditioning a GP on its own
+  predicted mean leaves the mean unchanged, so `alpha = 0` would return the same point
+  `n_points` times (breaking FR10). With pending points the exploitation term therefore becomes
+  the expected best outcome over the candidate and the pending points, estimated from joint
+  posterior samples (the `qSimpleRegret` construction). With no pending point it is exactly the
+  posterior mean, so a single candidate, and the first point of every batch, is still the pure
+  mean optimum. The consequence is that from the second point of a batch on, `alpha = 0` means
+  "best expected batch outcome", which credits uncertainty, rather than strictly "best
+  predicted mean".
+
+For multi-objective studies with no `Objective.weights`, the same blend applies, but the
+exploitation term becomes the expected hypervolume improvement over the model-predicted Pareto
+front, and the exploration term becomes the mean of the per-objective normalized posterior
+variances. `Objective.weights` controls *preference between objectives*; `alpha` controls
 *exploration vs. exploitation given that preference*. The two are orthogonal by design.
+
+Explicit weights scalarize the objectives (exactly as `toAxOptimizationConfig` hands Ax a
+weighted-sum objective), so a weighted multi-metric `Objective` is served by the
+single-objective function on the weighted sum of the direction-signed metrics, not by the
+hypervolume variant: scaling the axes of a hypervolume (with its reference point) leaves the
+best candidate unchanged, so it could not express a preference.
 
 ### 4.4 Handling the full budget range (FR: implicit, from the "4-5 to thousands" requirement)
 
@@ -305,7 +328,10 @@ functions), never Python's own `eval`.
 
 Its presence changes `BayesianOptimizer.ask()`'s behavior (ADR-0006): calling `ask()` with
 `alpha=None` would normally delegate to Ax's no-manual-tuning default strategy (FR4), but Ax
-cannot enforce a `NonlinearConstraint`, so in that case `boptim` instead forces its own custom
+cannot enforce a `NonlinearConstraint`, and neither can it enforce an equality
+`LinearConstraint` (`comparator="="`: its `parameter_constraints` accept inequalities only,
+ADR-0008). Every `Constraint` reports this through `requires_custom_acquisition_layer`. When any
+constraint does, in that case `boptim` instead forces its own custom
 acquisition layer with a fixed default `alpha` and logs a warning explaining why, rather than
 silently returning candidates that might violate a constraint the caller declared. Calling
 `ask()` with `alpha` passed explicitly already uses the custom layer, so nothing changes and no
@@ -629,7 +655,8 @@ boptim/
 │   │   ├── constraints/
 │   │   │   ├── Constraint.py        # Constraint (ABC), parameter-level
 │   │   │   ├── LinearConstraint.py  # LinearConstraint
-│   │   │   └── NonlinearConstraint.py  # NonlinearConstraint, FR17
+│   │   │   ├── NonlinearConstraint.py  # NonlinearConstraint, FR17
+│   │   │   └── validateExpression.py   # the restricted expression grammar
 │   │   ├── SearchSpace.py
 │   │   ├── Metric.py
 │   │   ├── Objective.py             # handles N >= 1 metrics, weights, outcome_constraints uniformly
@@ -638,17 +665,27 @@ boptim/
 │   │   └── StudySnapshot.py         # full persisted state
 │   ├── backends/
 │   │   ├── OptimizationBackend.py   # ABC
+│   │   ├── PredictionUnavailableError.py
 │   │   └── ax/
 │   │       ├── AxBackend.py
 │   │       ├── toAxSearchSpace.py
 │   │       ├── fromAxSearchSpace.py
 │   │       └── toAxOptimizationConfig.py
 │   ├── models/
-│   │   └── buildSurrogateModel.py
+│   │   ├── buildSurrogateModel.py
+│   │   ├── encodeTrials.py                      # trials -> training tensors
+│   │   ├── predictWithModel.py                  # (mean, sem) of a fitted model at a point
+│   │   ├── SearchSpaceEncoder.py                # SearchSpace <-> unit cube, ADR-0007
+│   │   ├── ParameterEncoding.py                 # one parameter's column layout
+│   │   └── compileExpression.py                 # restricted expression -> torch function
 │   ├── acquisition/
 │   │   ├── AcquisitionStrategy.py               # ABC
+│   │   ├── AlphaAcquisitionStrategy.py          # the implementation behind ask(alpha=...)
 │   │   ├── ExplorationExploitationAcquisition.py
 │   │   ├── MultiObjectiveExplorationExploitationAcquisition.py
+│   │   ├── EncodedConstraints.py                # constraints on the encoded tensor
+│   │   ├── sampleFeasibleEncoded.py             # constraint-satisfying space-filling draws
+│   │   ├── modelParetoFront.py
 │   │   └── toBotorchNonlinearConstraints.py     # FR17, ADR-0006
 │   ├── analysis/
 │   │   ├── SensitivityAnalyzer.py               # ABC
@@ -833,6 +870,10 @@ class LinearConstraint(Constraint):
 
         Example: a 3-component mixture summing to 1 is
         LinearConstraint({"a": 1.0, "b": 1.0, "c": 1.0}, bound=1.0, comparator="=").
+
+        Ax's parameter_constraints accept inequalities only, so a "=" constraint is
+        not given to Ax: it is enforced by boptim's own acquisition layer, and
+        requires_custom_acquisition_layer is True for it (ADR-0008).
         """
 
 
@@ -990,7 +1031,10 @@ class OptimizationBackend(ABC):
         """Returns {metric_name: (mean, sem)}. Matches Client.predict's own
         return shape (predicted mean and standard error of the mean, not
         variance) exactly, rather than converting to a different
-        uncertainty representation."""
+        uncertainty representation. Raises PredictionUnavailableError if the
+        backend has no model to predict with yet (AxBackend: while Ax is still in
+        its initial space-filling phase); BayesianOptimizer.predict then uses
+        boptim's own surrogate."""
 
     @abstractmethod
     def computeSensitivity(self) -> dict[str, dict[str, float]]:
@@ -1020,6 +1064,7 @@ class AxBackend(OptimizationBackend):
         passed straight through to
         Client.configure_generation_strategy (section 4.4); not
         reinvented, just exposed at construction time."""
+
     # implements every OptimizationBackend method by delegating to a private
     # ax.api.client.Client instance; exact accessor names confirmed against
     # https://ax.readthedocs.io/en/stable/api.html for this draft, re-check
@@ -1059,6 +1104,34 @@ def toAxOptimizationConfig(objective: Objective) -> tuple[str, list[str]]:
 ### 5.4 Surrogate model and acquisition layer
 
 ```python
+# models/SearchSpaceEncoder.py (ADR-0007)
+class SearchSpaceEncoder:
+    """Maps a SearchSpace onto the unit cube [0, 1]^d and back: Range -> one column (linear or
+    log scaled, rounded onto its grid for int/step ranges); ordered Choice -> one rank column;
+    unordered Choice -> a 0/1 column or a one-hot block; Fixed and Derived take no column.
+    decode() returns a parameterization Ax accepts: fixed values included, derived parameters
+    computed, parameters switched off by dependent_parameters dropped."""
+
+    def __init__(self, search_space: SearchSpace) -> None: ...
+    def encodeParameters(self, parameters: Mapping[str, LevelValue]) -> Tensor: ...
+    def decode(self, x: Tensor) -> dict[str, LevelValue]: ...
+    def snapColumns(self, x: Tensor) -> Tensor: ...
+    def sampleEncoded(self, n: int, seed: int | None = None, snap: bool = True) -> Tensor: ...
+    def rawRangeValues(self, x: Tensor) -> Tensor: ...  # natural values, for constraints
+    def roundingNeighbors(self, x: Tensor, max_ordinal: int = 8) -> Tensor: ...
+    def categoricalFixedFeatures(
+        self, max_combinations: int, seed: int | None = None
+    ) -> list[dict[int, float]]: ...
+
+
+# models/encodeTrials.py
+def encodeTrials(
+    encoder: SearchSpaceEncoder, objective: Objective, trials: Sequence[Trial]
+) -> tuple[Tensor, Tensor, Tensor | None]:
+    """(train_x, train_y, train_yvar). result_std becomes a fixed variance only when every
+    trial gives one for every metric; a partial set is ignored with a warning."""
+
+
 # models/buildSurrogateModel.py
 def buildSurrogateModel(
     train_x: Tensor,
@@ -1066,13 +1139,14 @@ def buildSurrogateModel(
     train_yvar: Tensor | None = None,
     minimum_points_for_free_fit: int = 5,
 ) -> Model:
-    """Builds a SingleTaskGP (or a multi-output model for multi-objective).
+    """Builds and fits a SingleTaskGP with one independent, internally standardized output per
+    column of train_y (so also the multi-objective case). train_x is already in the unit cube,
+    so no input transform is applied. Infers observation noise when train_yvar is None.
 
-    Infers observation noise when train_yvar is None. Below
-    minimum_points_for_free_fit observations, falls back to weakly informative
-    priors instead of a free marginal-likelihood fit (section 4.4). The single
-    swap point for a scalable/sparse GP in a future version.
-    """
+    Fitting is a MAP fit under BoTorch's default priors. minimum_points_for_free_fit is
+    accepted now and, in Phase 2, only logs a low-confidence message below it; the distinct
+    weakly-informative-prior fallback and explicit low-confidence signalling are Phase 3
+    (section 4.4). The single swap point for a scalable/sparse GP in a future version."""
 
 
 # acquisition/AcquisitionStrategy.py
@@ -1094,25 +1168,40 @@ class AcquisitionStrategy(ABC):
         search_space: SearchSpace,
         alpha: float,
         n_points: int,
+        seed: int | None = None,
     ) -> list[dict[str, float | int | str | bool]]:
         """Any NonlinearConstraint found in search_space.constraints (FR17)
         is converted by toBotorchNonlinearConstraints and passed to
         optimize_acqf as nonlinear_inequality_constraints; no separate
-        parameter for it, since SearchSpace already carries it."""
+        parameter for it, since SearchSpace already carries it. Every returned
+        point satisfies the search space's parameter constraints."""
+
+    @abstractmethod
+    def suggestSpaceFilling(
+        self,
+        search_space: SearchSpace,
+        n_points: int,
+        seed: int | None = None,
+    ) -> list[dict[str, float | int | str | bool]]:
+        """The cold start, used while there are too few trials to fit a model:
+        constraint-satisfying scrambled-Sobol points."""
 
 
 # acquisition/toBotorchNonlinearConstraints.py
 def toBotorchNonlinearConstraints(
     constraints: Sequence[NonlinearConstraint],
     parameter_order: Sequence[str],
-) -> list[tuple[Callable[[Tensor], float], bool]]:
+    constants: Mapping[str, float] | None = None,
+) -> list[tuple[Callable[[Tensor], Tensor], bool]]:
     """Compiles each NonlinearConstraint's string expression into the
     Tensor-taking callable BoTorch's optimize_acqf expects for its
     nonlinear_inequality_constraints argument (a value >= 0 meaning
     feasible; ">=" constraints pass through as-is, "<=" constraints are
     negated to fit that convention). parameter_order fixes which tensor
     column is which parameter, since the callable only sees a Tensor, not
-    named values."""
+    named values. constants supplies fixed numeric values an expression may
+    also reference. Each callable is intra-point (the bool is True) and returns
+    a Tensor, not a float: BoTorch differentiates it."""
 
 
 # acquisition/ExplorationExploitationAcquisition.py
@@ -1120,7 +1209,8 @@ class ExplorationExploitationAcquisition(MCAcquisitionFunction):
     """Blends a posterior-mean exploitation term and a posterior-variance
     exploration term: score(x) = (1 - alpha) * exploitation(x) + alpha *
     exploration(x), both min-max normalized over reference_points. See
-    section 4.3."""
+    section 4.3 for how pending points (batches) enter each term. Evaluates
+    single candidates (q = 1); batches are built sequentially via set_X_pending."""
 
     def __init__(
         self,
@@ -1129,16 +1219,21 @@ class ExplorationExploitationAcquisition(MCAcquisitionFunction):
         minimize: bool,
         reference_points: Tensor,
         sampler: MCSampler | None = None,
+        posterior_transform: PosteriorTransform
+        | None = None,  # scalarizes a weighted objective
+        X_pending: Tensor | None = None,
     ) -> None: ...
 
     def forward(self, X: Tensor) -> Tensor: ...
 
 
 # acquisition/MultiObjectiveExplorationExploitationAcquisition.py
-class MultiObjectiveExplorationExploitationAcquisition(MCAcquisitionFunction):
-    """Multi-objective generalization: exploitation is a (weighted)
-    hypervolume-improvement term over the current Pareto front, exploration
-    is an aggregate of per-objective posterior variance."""
+class MultiObjectiveExplorationExploitationAcquisition(MultiObjectiveMCAcquisitionFunction):
+    """Multi-objective generalization for the unweighted case: exploitation is the
+    expected hypervolume improvement over the model-predicted Pareto front (via
+    qExpectedHypervolumeImprovement), exploration is the mean of the per-objective
+    normalized posterior variances. objective_weights multiplies each outcome before
+    comparison: negative for a minimized objective, 1 for a maximized one."""
 
     def __init__(
         self,
@@ -1148,9 +1243,39 @@ class MultiObjectiveExplorationExploitationAcquisition(MCAcquisitionFunction):
         ref_point: Tensor,
         reference_points: Tensor,
         sampler: MCSampler | None = None,
+        X_pending: Tensor | None = None,
     ) -> None: ...
 
     def forward(self, X: Tensor) -> Tensor: ...
+
+
+# acquisition/AlphaAcquisitionStrategy.py
+class AlphaAcquisitionStrategy(AcquisitionStrategy):
+    """The AcquisitionStrategy behind ask(alpha=...). Picks the single-objective function for one
+    metric or a weighted objective (on the weighted sum), the multi-objective one otherwise;
+    enumerates unordered choices with optimize_acqf_mixed; optimizes integer/grid/ordered
+    parameters as continuous relaxations and rounds them, repairing a rounding that breaks a
+    constraint; falls back to the best feasible random point if the optimizer returns an
+    infeasible one."""
+
+    def __init__(
+        self,
+        num_restarts: int = 10,
+        raw_samples: int = 512,
+        n_reference_points: int = 512,
+        n_mc_samples: int = 256,
+        max_categorical_combinations: int = 32,
+        max_iterations: int = 200,
+        polytope_burn_in: int = 200,
+        polytope_thinning: int = 10,
+    ) -> None:
+        """polytope_burn_in and polytope_thinning configure the hit-and-run sampler that draws
+        starting points inside linear constraints. BoTorch's own defaults (10000 and 32) are
+        much more expensive; 200 and 10 were chosen from measurements (burn-in made no
+        measurable difference to the sampled distribution, thinning is the expensive knob and
+        costs independence of the samples in high dimension), documented where the constants
+        are defined, `acquisition/sampleFeasibleEncoded.py`. Raise `polytope_thinning` for a
+        high-dimensional polytope."""
 ```
 
 ### 5.5 Analysis layer
@@ -1247,6 +1372,7 @@ class BayesianOptimizer:
         name: str = "study",
         random_seed: int | None = None,
         backend: OptimizationBackend | None = None,
+        acquisition_strategy: AcquisitionStrategy | None = None,
     ) -> None:
         """The main entry point. Two ways to call it:
 
@@ -1306,9 +1432,11 @@ class BayesianOptimizer:
                 that case. See section 4.6, ADR-0006.
         """
 
-
     def predict(self, x: dict[str, float | int | str | bool]) -> PredictionResult:
-        """FR7, FR8."""
+        """FR7, FR8. Uses the backend's own model when it has one; otherwise
+        (early in a study) boptim's own surrogate, fit on the trial history and
+        cached until the next tell() (ADR-0007). Raises PredictionUnavailableError
+        below two completed trials."""
 
     def parameterImportance(self) -> dict[str, dict[str, float]]:
         """Refits/queries the surrogate model: has a cost, camelCase. FR6."""
@@ -1346,12 +1474,14 @@ class BayesianOptimizer:
         about it through this same escape hatch, not automatically."""
 
     def fitModel(self) -> Model:
-        """Escape hatch (FR16, ADR-0005): fits and returns the current
-        BoTorch surrogate model directly (the same one acquisition/ builds
-        on), so a caller can write and optimize their own acquisition
-        function with plain BoTorch and feed the result back through
-        tell(), without forking boptim to get an acquisition behavior the
-        alpha dial does not cover."""
+        """Escape hatch (FR16, ADR-0005): the BoTorch surrogate model Ax
+        currently holds, so a caller can write and optimize their own
+        acquisition function with plain BoTorch and feed the result back
+        through tell(), without forking boptim to get an acquisition behavior
+        the alpha dial does not cover. This is Ax's model, in Ax's transformed
+        input space, and only exists once Ax has left its initial
+        space-filling phase; it is not the model ask(alpha=...) uses (that one
+        is fit by boptim itself, ADR-0007)."""
 ```
 
 ### 5.8 Usage example
@@ -1380,18 +1510,20 @@ bo.tell(
 
 # ask for a single point, leaning toward exploitation
 x = bo.ask(alpha=0.2)[0]
-y = run_my_experiment(**x)          # your own code: a real experiment or a training run
+y = run_my_experiment(**x)  # your own code: a real experiment or a training run
 bo.tell(x, {"objective": y})
 
 # ask for a batch of 3, balanced exploration/exploitation (FR10)
 batch = bo.ask(n_points=3, alpha=0.5)
 
 # what does the model currently believe, with uncertainty? (FR7, FR8)
-prediction = bo.predict({"temperature": 100.0, "num_layers": 4, "solvent": "ethanol", "use_catalyst": False})
+prediction = bo.predict(
+    {"temperature": 100.0, "num_layers": 4, "solvent": "ethanol", "use_catalyst": False}
+)
 print(prediction.mean, prediction.sem)
 
-bo.parameterImportance()            # FR6
-bo.save("study.json")               # FR11, FR12
+bo.parameterImportance()  # FR6
+bo.save("study.json")  # FR11, FR12
 bo_reloaded = BayesianOptimizer.load("study.json")
 ```
 
@@ -1404,14 +1536,17 @@ activating `hidden_units`, `hp.conditional_scope("model_type", ["cnn"])` activat
 ```python
 from boptim import BayesianOptimizer, Categorical, Integer
 
-bo = BayesianOptimizer(parameters=[
-    Categorical(
-        "model_type", ["mlp", "cnn"],
-        dependent_parameters={"mlp": ["hidden_units"], "cnn": ["num_filters"]},
-    ),
-    Integer("hidden_units", 8, 512),
-    Integer("num_filters", 8, 256),
-])
+bo = BayesianOptimizer(
+    parameters=[
+        Categorical(
+            "model_type",
+            ["mlp", "cnn"],
+            dependent_parameters={"mlp": ["hidden_units"], "cnn": ["num_filters"]},
+        ),
+        Integer("hidden_units", 8, 512),
+        Integer("num_filters", 8, 256),
+    ]
+)
 ```
 
 A nonlinear feasibility constraint (FR17, section 4.6), and the automatic switch it triggers
@@ -1426,19 +1561,19 @@ bo = BayesianOptimizer(
     objective="maximize",
 )
 
-bo.ask()   # alpha left at its default: NOT Ax's usual no-tuning strategy here, since
-           # Ax cannot enforce the constraint above. boptim switches to its own
-           # acquisition layer with alpha=DEFAULT_ALPHA_WHEN_FORCED and logs a
-           # warning saying so. bo.ask(alpha=0.3) would use that layer directly,
-           # with no warning, since nothing is happening implicitly in that case.
+bo.ask()  # alpha left at its default: NOT Ax's usual no-tuning strategy here, since
+# Ax cannot enforce the constraint above. boptim switches to its own
+# acquisition layer with alpha=DEFAULT_ALPHA_WHEN_FORCED and logs a
+# warning saying so. bo.ask(alpha=0.3) would use that layer directly,
+# with no warning, since nothing is happening implicitly in that case.
 ```
 
 The escape hatch (FR16, ADR-0005), for a feature `boptim` does not wrap, here Ax's closed-loop
 `run_trials` (section 4.7):
 
 ```python
-bo.axClient.run_trials(max_trials=20)   # Ax drives the loop itself; see ADR-0005's caveat
-                                          # about this bypassing boptim's own bookkeeping
+bo.axClient.run_trials(max_trials=20)  # Ax drives the loop itself; see ADR-0005's caveat
+# about this bypassing boptim's own bookkeeping
 ```
 
 ---
@@ -1471,6 +1606,13 @@ the same phase, since they are only enforceable once this layer exists; `ask()`'
 switch and warning (ADR-0006) is built and tested alongside them, not after. `examples/
 ml_hyperparameter_search.py` and `examples/nonlinear_constraint.py` follow once `alpha` is
 usable.
+
+*Status: implemented. See ADR-0007 (the layer fits its own surrogate), the corrected batch
+mechanism in section 4.3, and the evidence on the forced default in ADR-0006. Not yet covered,
+by design or by deferral: `OutcomeConstraint`s are not enforced by the custom layer (a warning
+is logged); `dependent_parameters` are optimized as if all were active and pruned when
+decoding (Phase 3 makes the layer reason about them); `LinearConstraint`s on log-scaled
+parameters are rejected by the custom layer.*
 
 **Phase 3: Robustness across the full budget range, and deferred hard problems**
 Weakly-informative-prior fallback for very small trial counts (down to the 4-5-evaluation

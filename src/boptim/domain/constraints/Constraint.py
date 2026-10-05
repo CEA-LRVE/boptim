@@ -14,14 +14,37 @@ class Constraint(BaseModel, ABC):
     apply to a different thing entirely: an observed value, not a decision
     variable).
 
-    `LinearConstraint` is the only concrete subclass in Phase 1 (FR9,
-    Ax-native). `NonlinearConstraint` (FR17) is deferred to Phase 2, since it
-    is only enforceable once `boptim`'s own custom acquisition layer exists
-    (section 4.6, ADR-0006); `SearchSpace.constraints: Sequence[Constraint]`
-    already accepts any future `Constraint` subclass without changes.
+    `LinearConstraint` (FR9) is enforced by Ax itself, except for its `"="`
+    form. `NonlinearConstraint` (FR17) is only enforceable by `boptim`'s own
+    custom acquisition layer (section 4.6, ADR-0006, ADR-0008);
+    `SearchSpace.constraints: Sequence[Constraint]` accepts any future
+    `Constraint` subclass without changes.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    def __init__(self, **data: Any) -> None:
+        """Validates and stores the fields of a concrete constraint.
+
+        Declared explicitly so that type checkers accept the keyword arguments each
+        concrete subclass forwards from its own constructor (`coefficients`,
+        `expression`, ...): without it they only know this base class, which has no
+        fields. Pydantic still validates everything at runtime.
+
+        Args:
+            **data: The fields of the concrete subclass, as keyword arguments.
+        """
+        super().__init__(**data)
+
+    @property
+    def requires_custom_acquisition_layer(self) -> bool:
+        """Whether Ax's default generation strategy cannot enforce this
+        constraint, so that only `boptim`'s own acquisition layer can
+        (`BayesianOptimizer.ask()` switches to it, with a warning, when the
+        caller leaves `alpha` unset). `False` unless a subclass says otherwise.
+        Cheap (no work), snake_case.
+        """
+        return False
 
     @abstractmethod
     def toDict(self) -> dict[str, Any]:

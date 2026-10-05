@@ -42,6 +42,15 @@ class SearchSpace(BaseModel):
         parameters: Sequence[Parameter],
         constraints: Sequence[Constraint] | None = None,
     ) -> None:
+        """Creates a search space from parameters and optional constraints.
+
+        Args:
+            parameters: The parameters. Names must be unique.
+            constraints: Optional parameter-level constraints.
+
+        Raises:
+            ValueError: if two parameters share a name.
+        """
         super().__init__(
             parameters=list(parameters),
             constraints=list(constraints) if constraints is not None else [],
@@ -54,26 +63,62 @@ class SearchSpace(BaseModel):
         objects; already-built `Parameter` instances pass through untouched.
         """
         if isinstance(value, list):
-            return [parameterFromDict(item) if isinstance(item, dict) else item for item in value]
+            return [
+                parameterFromDict(item) if isinstance(item, dict) else item for item in value
+            ]
         return value
 
     @field_validator("constraints", mode="before")
     @classmethod
     def _rebuildConstraints(cls, value: Any) -> Any:
+        """Turns tagged dicts (a reloaded study) back into `Constraint` objects.
+
+        Args:
+            value: The raw `constraints` field.
+
+        Returns:
+            The list with each dict rebuilt; built constraints pass through untouched.
+        """
         if isinstance(value, list):
-            return [constraintFromDict(item) if isinstance(item, dict) else item for item in value]
+            return [
+                constraintFromDict(item) if isinstance(item, dict) else item for item in value
+            ]
         return value
 
     @field_serializer("parameters")
     def _dumpParameters(self, parameters: list[Parameter]) -> list[dict[str, Any]]:
+        """Serializes the parameters through their own type-tagged `toDict`.
+
+        Args:
+            parameters: The parameters.
+
+        Returns:
+            One dict per parameter.
+        """
         return [parameter.toDict() for parameter in parameters]
 
     @field_serializer("constraints")
     def _dumpConstraints(self, constraints: list[Constraint]) -> list[dict[str, Any]]:
+        """Serializes the constraints through their own type-tagged `toDict`.
+
+        Args:
+            constraints: The constraints.
+
+        Returns:
+            One dict per constraint.
+        """
         return [constraint.toDict() for constraint in constraints]
 
     @model_validator(mode="after")
     def _validateUniqueNames(self) -> SearchSpace:
+        """Checks that no two parameters share a name.
+
+        Returns:
+            The search space itself.
+
+        Raises:
+            ValueError: on a duplicate name.
+        """
         names = [parameter.name for parameter in self.parameters]
         duplicates = {name for name in names if names.count(name) > 1}
         if duplicates:
@@ -87,9 +132,7 @@ class SearchSpace(BaseModel):
         with an existing one.
         """
         if parameter.name in self.parameter_names:
-            raise ValueError(
-                f"SearchSpace already has a parameter named {parameter.name!r}."
-            )
+            raise ValueError(f"SearchSpace already has a parameter named {parameter.name!r}.")
         self.parameters.append(parameter)
 
     def addConstraint(self, constraint: Constraint) -> None:

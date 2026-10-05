@@ -55,7 +55,9 @@ class TestChoice:
         }
 
     def test_to_ax_kwargs_excludes_default(self) -> None:
-        parameter = Choice("solvent", ["water", "ethanol"], parameter_type="str", default="water")
+        parameter = Choice(
+            "solvent", ["water", "ethanol"], parameter_type="str", default="water"
+        )
         kwargs = parameter.toAxKwargs()
         assert "default" not in kwargs
         assert kwargs["values"] == ["water", "ethanol"]

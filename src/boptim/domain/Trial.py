@@ -36,6 +36,15 @@ class Trial(BaseModel):
         result_std: dict[str, float] | None = None,
         trial_index: int | None = None,
     ) -> None:
+        """Creates a trial.
+
+        Args:
+            parameters: Parameter name to the value this trial used.
+            results: Metric name to the observed value.
+            result_std: Optional metric name to the known standard deviation of that
+                observation.
+            trial_index: The backend-assigned index, once attached to a backend.
+        """
         super().__init__(
             parameters=parameters,
             results=results,

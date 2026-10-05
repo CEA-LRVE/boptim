@@ -47,7 +47,9 @@ class FakeBackend(OptimizationBackend):
     def fitModel(self) -> Any:
         raise RuntimeError("FakeBackend has no real surrogate model to fit.")
 
-    def predict(self, x: dict[str, float | int | str | bool]) -> dict[str, tuple[float, float]]:
+    def predict(
+        self, x: dict[str, float | int | str | bool]
+    ) -> dict[str, tuple[float, float]]:
         return {"objective": (0.5, 0.1)}
 
     def computeSensitivity(self) -> dict[str, dict[str, float]]:

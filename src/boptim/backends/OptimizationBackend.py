@@ -57,11 +57,19 @@ class OptimizationBackend(ABC):
         """
 
     @abstractmethod
-    def predict(self, x: dict[str, float | int | str | bool]) -> dict[str, tuple[float, float]]:
+    def predict(
+        self, x: dict[str, float | int | str | bool]
+    ) -> dict[str, tuple[float, float]]:
         """Returns `{metric_name: (mean, sem)}`. Matches `Client.predict`'s
         own return shape (predicted mean and standard error of the mean, not
         variance) exactly, rather than converting to a different uncertainty
         representation.
+
+        Raises:
+            PredictionUnavailableError: if the backend has no model to predict
+                with yet (e.g. it is still in an initial space-filling phase).
+                `BayesianOptimizer.predict` falls back to boptim's own surrogate
+                in that case.
         """
 
     @abstractmethod

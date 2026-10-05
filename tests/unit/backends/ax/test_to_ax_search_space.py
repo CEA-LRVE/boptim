@@ -42,7 +42,11 @@ class TestToAxSearchSpace:
 
     def test_derived_maps_to_derived_parameter_config(self) -> None:
         search_space = SearchSpace(
-            parameters=[Real("a", 0.0, 1.0), Real("b", 0.0, 1.0), Derived("total", "a + b", parameter_type="float")]
+            parameters=[
+                Real("a", 0.0, 1.0),
+                Real("b", 0.0, 1.0),
+                Derived("total", "a + b", parameter_type="float"),
+            ]
         )
         ax_parameters = toAxSearchSpace(search_space)
         derived = [p for p in ax_parameters if isinstance(p, DerivedParameterConfig)]

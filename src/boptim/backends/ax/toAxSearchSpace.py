@@ -40,6 +40,17 @@ def toAxSearchSpace(search_space: SearchSpace) -> list[Any]:
 
 
 def _toAxParameterConfig(parameter: Parameter) -> Any:
+    """Converts one boptim `Parameter` into the matching Ax parameter config.
+
+    Args:
+        parameter: A `Range`, `Choice` or `Derived` (or a subclass such as `Real`).
+
+    Returns:
+        The Ax `RangeParameterConfig`, `ChoiceParameterConfig` or `DerivedParameterConfig`.
+
+    Raises:
+        TypeError: if the parameter is of no known kind.
+    """
     if isinstance(parameter, Range):
         return RangeParameterConfig(**parameter.toAxKwargs())
     if isinstance(parameter, Choice):

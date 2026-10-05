@@ -9,7 +9,7 @@ real `AxBackend.exportState()` would have produced.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from boptim import Categorical, LinearConstraint, Metric, Objective, Real, SearchSpace, Trial
@@ -41,7 +41,7 @@ def _snapshot() -> StudySnapshot:
         reproducibility=ReproducibilityMetadata(
             random_seed=42,
             library_versions={"boptim": "0.1.0"},
-            created_at=datetime(2026, 9, 25, tzinfo=timezone.utc),
+            created_at=datetime(2026, 9, 25, tzinfo=UTC),
             boptim_version="0.1.0",
         ),
         backend_state={"fake": "ax-client-json-goes-here"},

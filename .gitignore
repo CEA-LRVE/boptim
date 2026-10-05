@@ -26,3 +26,4 @@ site/
 # Example script output (created by examples/lab_experiment.py)
 reactor_yield_campaign.json
 file_differents.py
+questions.md

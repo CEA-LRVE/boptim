@@ -36,6 +36,14 @@ class Derived(Parameter):
         parameter_type: Literal["float", "int", "str", "bool"],
         default: None = None,
     ) -> None:
+        """Creates a derived parameter.
+
+        Args:
+            name: The parameter's name.
+            expression: The expression computing this parameter's value from others.
+            parameter_type: The type the expression evaluates to.
+            default: Always `None`: a derived parameter is computed, never chosen.
+        """
         # `default` exists only so `Derived.model_validate(d.model_dump())`
         # works (a dump contains `default=None`); anything but None is
         # rejected by `_validate_default`.
@@ -47,6 +55,11 @@ class Derived(Parameter):
         )
 
     def _validate_default(self) -> None:
+        """Checks there is no default and the expression is not empty.
+
+        Raises:
+            ValueError: if a default is set or the expression is blank.
+        """
         if self.default is not None:
             raise ValueError(
                 f"Derived parameter {self.name!r} cannot have a default value: "
@@ -68,6 +81,11 @@ class Derived(Parameter):
         }
 
     def toDict(self) -> dict[str, Any]:
+        """Serializes the parameter.
+
+        Returns:
+            A type-tagged, JSON-compatible form, rebuilt by `parameterFromDict`.
+        """
         return {
             "kind": "derived",
             "name": self.name,

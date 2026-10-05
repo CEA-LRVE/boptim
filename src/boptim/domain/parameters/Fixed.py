@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from boptim.domain.parameters.Choice import ChoiceValue, Choice
+from boptim.domain.parameters.Choice import Choice, ChoiceValue
 
 
 class Fixed(Choice):
@@ -24,6 +24,15 @@ class Fixed(Choice):
     """
 
     def __init__(self, name: str, value: ChoiceValue) -> None:
+        """Creates a fixed, non-optimized parameter.
+
+        Args:
+            name: The parameter's name.
+            value: The constant value. Its type decides the parameter type.
+
+        Raises:
+            TypeError: if the value is not a `bool`, `int`, `float` or `str`.
+        """
         # `bool` is a subclass of `int` in Python, so it must be checked
         # before `int` or every boolean fixed value would be misclassified.
         # Branching with `isinstance` here (rather than a shared helper) lets

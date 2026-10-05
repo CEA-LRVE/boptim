@@ -14,8 +14,9 @@ uv run python scripts/check_naming_convention.py
 
 This project deliberately deviates from PEP8's naming rules for callables and for file names.
 The deviation is intentional and enforced (`tool.ruff.lint.ignore` in `pyproject.toml` disables
-`N802`/`N803`/`N806`, and `scripts/check_naming_convention.py` runs in CI), so please do not
-"fix" it back to `snake_case` — that would be reverting a deliberate decision, not a cleanup.
+`N802`/`N803`/`N806` for function, argument and variable names and `N999` for module names, and
+`scripts/check_naming_convention.py` runs in CI), so please do not "fix" it back to
+`snake_case`: that would be reverting a deliberate decision, not a cleanup.
 
 - **Classes** -> `CamelCase` (e.g. `SearchSpace`, `Real`, `ExplorationExploitationAcquisition`).
 - **Variables** (including function/method parameters) -> `snake_case` (e.g. `n_points`,
@@ -59,6 +60,17 @@ practice: `parameters/`, `constraints/`, `acquisition/` each split this way).
 ## Docstrings
 
 Google-style, mandatory on every public class/function: purpose, `Args`, `Returns`, `Raises`.
+
+`ruff` enforces that a docstring exists (rule family `D1` with the Google convention, set in
+`pyproject.toml`; `tests/` is exempt). What the docstring says is left to review. Document a
+constructor's arguments in the class docstring or in `__init__`, but say each thing once.
+
+## Type checking
+
+`uv run mypy` runs in strict mode. numpy's own type stubs use Python 3.12 syntax, which mypy
+rejects while `python_version` is 3.11 (the project's minimum), and that one error stops all
+checking; `pyproject.toml` therefore tells mypy to skip numpy's stubs. If `uv run mypy` ever
+reports a syntax error inside `site-packages`, check that override first.
 
 ## Version control
 

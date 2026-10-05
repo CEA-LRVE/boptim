@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 
 #: Packages whose installed version is recorded in `library_versions` so a
@@ -70,6 +70,6 @@ class ReproducibilityMetadata:
         return ReproducibilityMetadata(
             random_seed=random_seed,
             library_versions=library_versions,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             boptim_version=library_versions["boptim"],
         )
