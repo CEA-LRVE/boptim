@@ -1,1734 +1,610 @@
 # boptim: Project Specification
 
-**A general-purpose, domain-agnostic Bayesian Optimization library for Python.**
-
-- Version: 0.2 (draft)
-- Date: 2026-09-23
-- Status: Draft, pending review by the project owner
-
-> Scope note: this document fixes the technology stack, the architecture, the functional
-> specification, the roadmap, and the signatures of the main files, classes, methods and
-> functions. It deliberately stops at signatures and short docstrings, not full
-> implementations: the goal is to agree on the contract before writing code. `boptim` is a
-> working name for the package; check PyPI availability before publishing and rename freely.
-> This revision grounds the parameter model directly in Ax's own current API reference
-> (https://ax.readthedocs.io/en/stable/api.html), rather than in earlier, partly-inferred
-> assumptions about it; where the two conflict, this revision wins.
+**Status:** living document, v0.3.
+**Purpose:** this document is the ground truth for the boptim project. Any conversation or contributor (human or LLM) working on the project MUST treat it as authoritative. When something here is ambiguous or missing, ask rather than assume (section 12).
 
 ---
 
-## 0. Language & conventions
+## 0. Language and conventions
 
 - Conversations about the project may happen in any language (typically French).
-- All code, docstrings, comments, config keys, commit messages, and technical documentation
-  **must be written in English** (research/industry standard, needed for eventual publication
-  and collaboration).
+- All code, docstrings, comments, configuration keys, commit messages and technical documentation MUST be written in English (research and industry standard, and needed for publication and collaboration).
+- Section numbers in this document are stable references: code comments and ADRs cite them (for example "section 10"). A section is never renumbered silently. If the structure must change, the roadmap carries a task to update every citation.
 
 ---
 
-## 1. Project overview
+## 1. Vision and scope
 
-### 1.1 What this is
+### 1.1 What boptim is
 
-`boptim` is a standalone Python library implementing Bayesian Optimization (BO) as a
-**general-purpose, domain-agnostic** tool. It is a generic black-box optimization engine that
-is used, among other things, by a laboratory and by machine-learning practitioners.
-Concretely, this means the library must be equally comfortable with:
+boptim is a general-purpose, domain-agnostic toolkit for **sequential experimental design with probabilistic surrogate models**, Gaussian processes first. The caller describes what can be varied (the *search space*), what is measured (the *outcomes*) and what they want (a *goal*). boptim proposes which points to evaluate next, learns from the results, and reports what it has learned.
 
-- A campaign of **4-5 evaluations total**, each one extremely costly (physical experiments
-  that can cost on the order of EUR 1,000,000 each), where every single suggested point
-  matters and no evaluation can be "wasted" on uninformed exploration.
-- A campaign of a **few hundred evaluations** (typical ML hyperparameter tuning).
-- Campaigns that may run into the **thousands** of evaluations for cheap, fast objectives.
-- Observations that are **noisy** (repeating the same point gives a different result) or
-  **effectively deterministic**, without the caller having to pre-classify which case they
-  are in.
+Bayesian optimization is one goal among several. The same loop serves level-set estimation (finding the boundary where an outcome crosses a level, for example the boundary between two phases of a material), active learning (learning a surrogate as well as possible within a budget), feasibility search, calibration, and plain surrogate modelling with no loop at all. No outcome is privileged: nothing in the core assumes that the point of a study is to minimize a number.
 
-### 1.2 What this is not (for now)
+boptim must be comfortable at every scale without the caller classifying the problem in advance: a campaign of four or five extremely costly physical experiments, a few hundred machine-learning trials, or thousands of cheap evaluations (section 8).
 
-- Not a REST/HTTP service. `boptim` is a pure Python library, imported directly into whatever
-  code calls it. A service layer is an explicit non-goal for this phase.
-- Not the end-user application itself. The "application for the lab" mentioned in the original
-  request is a separate, later project that will sit on top of `boptim`.
-- Not a reimplementation of what Ax already does well. Where Ax's own API
-  (`ax.api.configs`, `ax.api.client.Client`) already has a clean shape for something,
-  `boptim`'s domain layer mirrors that shape and its backend delegates to it, rather than
-  inventing a parallel abstraction. Section 4.5 and 4.6 are about exactly this.
+### 1.2 What boptim is not
 
-### 1.3 Design philosophy
+- Not a re-implementation, and not a thin re-wrapping, of BoTorch or GPyTorch. Tensor-level work stays in those libraries (section 1.4).
+- Not a neural-network training library and not a reinforcement-learning framework.
+- Not an optimizer for structured inputs (graphs, molecules, sequences) in its core. A plugin may add a new parameter kind; the core makes no promise beyond tabular parameterizations (section 5.3).
+- Not a service. No server, scheduler, job queue or user interface. Evaluating the suggested points is the caller's job, through the ask/tell cycle.
+- Not a data tool. Reading files, pairing records and splitting data are the caller's responsibility.
 
-1. **Flexibility over convention.** Every numeric default (initial design size, noise
-   assumption, exploration/exploitation blend, batch size, etc.) is a *default*, never a
-   hardcoded assumption. Nothing in the domain layer encodes "this is for a lab" or "this is
-   for ML".
-2. **`boptim`'s public API is its own, but it is not a cage.** Ax and BoTorch are
-   implementation details behind an adapter for the common case, not something a caller has
-   to understand to get started. But a high-level facade will always fall short of some
-   power-user need, so `BayesianOptimizer` also exposes the underlying `ax.api.client.Client`
-   and the current fitted BoTorch model directly (`axClient`, `fitModel()`, section 5.7,
-   ADR-0005). The point of the facade is a clean default path, not a locked door.
-3. **Single-objective is the N = 1 case of multi-objective**, not a separate code path. There
-   is one `Objective` concept everywhere in the codebase.
-4. **The exploration/exploitation dial is orthogonal to everything else.** It is not tied to
-   a specific number of objectives, a specific noise model, or a specific budget size.
-5. **Don't recode what Ax already codes.** Search space definition, conditional/hierarchical
-   parameters, sensitivity analysis, Pareto-frontier and best-trial lookup, and JSON
-   persistence all have a native Ax primitive; `boptim`'s job there is a thin, typed,
-   boptim-flavored pass-through, not a reimplementation. FR5 (the alpha dial) is the one
-   genuine exception, and the whole reason this project is more than a thin Ax wrapper.
+### 1.3 "Everything is possible" is a property of the architecture
 
-### 1.4 Defaults chosen for this draft (flag for review)
+boptim cannot ship every acquisition function, kernel or goal. What it guarantees is this: anything that fits the loop *probabilistic model of the outcomes -> score of candidate points -> choice of points -> observation* can be added by writing components and registering them, without changing boptim's core. The guarantee is tested, not promised: the reference use cases (section 7) include one that runs on components defined entirely outside the package.
 
-| Item | Default chosen | Why |
-|---|---|---|
-| Package name | `boptim` | Placeholder. Short, descriptive, likely available; verify on PyPI. |
-| `mypy` strictness | `--strict` | Matches "type hints mandatory everywhere" from section 10. |
-| License | Not set (TBD) | Depends on whether this stays internal or gets published; not an architectural decision. |
-| Build backend | `uv_build` (or `hatchling`) under `uv` | See ADR-0002 in section 4.8. |
+A request that cannot be satisfied this way reveals a design defect. The remedy is to move or add a seam (sections 3.3 and 3.10), never to special-case the request inside the core.
+
+### 1.4 Relationship to the engines
+
+- **BoTorch and GPyTorch are the engine.** They own model classes, kernels, likelihoods, acquisition functions, acquisition optimizers, sampling and fitting. boptim's contracts reuse their native interfaces: a surrogate is, or exposes, a BoTorch `Model`; an acquisition is a BoTorch `AcquisitionFunction`. Where the engine already has a class, boptim registers a builder for it instead of re-implementing it. New mathematics that boptim has to write (for example a level-set acquisition function that the engine lacks) is written as a native engine subclass, so that it works with the engine's own optimizers.
+- **Ax is optional.** It is one possible policy adapter (section 5.9), installed through an extra. Only the `adapters` layer may import `ax.*`, and the core MUST import and run without Ax installed.
+- **Other engines** (scikit-learn, JAX, ...) are outside the core. A plugin may adapt one by satisfying the surrogate contract.
 
 ---
 
 ## 2. Functional requirements
 
-| ID | Requirement | Notes |
-|---|---|---|
-| FR1 | Define a search space with `float`, `int`, categorical and boolean parameters, with bounds and linear/log scales, plus fixed and derived (computed) parameters. | See section 5.2: `Range`/`Real`/`Integer`, `Choice`/`Categorical`/`Boolean`, `Fixed`, `Derived`. |
-| FR2 | Define one or more objectives, each minimized or maximized, with optional relative importance weights. | N = 1 must behave identically to a "simple" single-objective API; N > 1 supports both weighted and unweighted (Pareto) preference. |
-| FR3 | Manually inject an arbitrary (parameters, result) pair, bypassing `ask()`. | Needed to seed a study from prior data, and to record points evaluated outside `boptim`. |
-| FR4 | Suggest the next point(s) automatically with a high-performing strategy, with no manual tuning of surrogate-model or acquisition-function hyperparameters required. | This is the "no manual tuning" requirement; it governs the *default* path, not the alpha-controlled path (FR5). |
-| FR5 | Control the exploration/exploitation trade-off with a single continuous parameter `alpha` in `[0, 1]`: `0.0` favors the best predicted objective (pure exploitation), `1.0` favors the least-known region of the search space (pure exploration), `0.5` balances both. | This is the requirement Ax does not expose natively; see section 4.3. |
-| FR6 | Report each parameter's importance with respect to each objective. | |
-| FR7 | Predict the expected result for an arbitrary (not necessarily evaluated) parameterization. | |
-| FR8 | Report how reliable a prediction or a suggestion is (calibrated uncertainty), not just a point estimate. | Applies to FR7 and, where meaningful, to FR6. |
-| FR9 | Support constraints across parameters (e.g. a mixture's proportions summing to 1, or linear inequalities between parameters). | Linear constraints for V1; see section 6 for nonlinear constraints as a later extension. |
-| FR10 | Suggest a batch of `n >= 1` points in a single call, jointly optimized (not `n` copies of the same point). | Needed for parallel evaluations (e.g. several reactors, a well plate, several ML training jobs at once). |
-| FR11 | Save a study to disk and reload it later, resuming exactly where it left off. | A campaign can span days or weeks with the process restarting in between. |
-| FR12 | Make a saved study reproducible: the random seed, library versions, and full trial history are recorded, not just the final state. | |
-| FR13 | Support a per-parameter default value and, for `Real`/`Integer`, an optional fixed sampling step. | Ergonomics, not core optimization logic; added after seeing Keras Tuner's `HyperParameters` API. |
-| FR14 | Support conditional (hierarchical) parameters: a parameter that only applies when another parameter takes a specific value. | Directly exposes Ax's own `dependent_parameters` mechanism on `Choice` (section 4.5, 5.2); not a boptim-invented mechanism. Definition/persistence is solid; genuine optimization-quality benefit from the structure is weaker, tracked separately. |
-| FR15 | Support constraints on an observed metric, not just on parameters (e.g. "the result must reach at least X"). | Mirrors Ax's own `outcome_constraints`. See `OutcomeConstraint`, section 5.2. |
-| FR16 | Give a documented way to use Ax and BoTorch directly for anything the high-level facade does not cover, without forking the library. | `BayesianOptimizer.axClient` / `.fitModel()`. See design philosophy #2, ADR-0005. |
-| FR17 | Support a feasibility constraint across parameters expressed as an arbitrary (nonlinear) expression, e.g. `var * x ** z <= n`. | Not expressible through Ax's own (linear-only) `parameter_constraints`; enforced by `boptim`'s own acquisition layer via BoTorch's `nonlinear_inequality_constraints` instead. See `NonlinearConstraint`, section 4.6, section 5.2, ADR-0006. |
+Requirements are stated at the generality the architecture must support. A requirement written for one case (for example "a weight on exploration") is the first instance of a mechanism, not the mechanism itself (section 3.2). Identifiers FR1 to FR17 are stable and are cited by code and tests; FR18 onward were added with the v0.3 rewrite.
+
+| ID | Requirement |
+|---|---|
+| FR1 | Declare a search space from typed parameters: real, integer, ordinal, categorical, boolean, fixed and derived. |
+| FR2 | Declare what is measured (outcomes, each of a kind) and what is wanted (a goal). Optimizing one or several outcomes is one goal type among others. |
+| FR3 | Inject already-known data (points with observations) without asking for them first. |
+| FR4 | Obtain suggestions from a default policy that needs no manual tuning, for any goal type and at any budget. |
+| FR5 | Control the balance between exploration and exploitation. The blend driven by a single weight (the "alpha dial") is one built-in acquisition, selected like any other. |
+| FR6 | Report how much each parameter matters for each outcome (an analysis of the surrogate). |
+| FR7 | Predict the outcomes at any parameterization (a surrogate operation, available without any loop). |
+| FR8 | Report calibrated uncertainty for predictions and suggestions, and state what it describes: the latent function or the observed response, with or without observation noise. |
+| FR9 | Constrain the inputs with linear inequalities and equalities. |
+| FR10 | Request batches of suggestions that complement each other, and keep asking while earlier suggestions are still being evaluated. |
+| FR11 | Save a study to a single file and reload it to continue. |
+| FR12 | Reproduce a study: its seed, library versions, full trial history and fully resolved configuration are stored. |
+| FR13 | Give parameters defaults and discrete steps. |
+| FR14 | Declare conditional parameters (parameters that only exist when another parameter takes a given value). |
+| FR15 | Constrain observed outcomes (for example a throughput that must stay above a floor) as part of a goal. |
+| FR16 | Reach the underlying engine objects and supply custom components without forking boptim. |
+| FR17 | Constrain the inputs with nonlinear expressions that survive saving and reloading. |
+| FR18 | Select every component by name in configuration: surrogate (with its kernel, likelihood, transforms and fitting procedure), acquisition, acquisition optimizer, design, goal, analysis, stopping criterion, policy and repository. |
+| FR19 | Register new components of any kind from user code or from an external package, with no change to boptim. |
+| FR20 | Estimate level sets and boundaries of an outcome, for continuous outcomes and for binary (label) outcomes. |
+| FR21 | Learn a surrogate efficiently with no optimization target (active learning, exploration). |
+| FR22 | Use the surrogate alone: fit, predict, draw samples and run analyses without an ask/tell loop. |
+| FR23 | Track the trial lifecycle (pending, completed, failed, abandoned) and support asynchronous asking. |
+| FR24 | Support several outcome kinds (continuous and binary first), extensible by plugins. |
+| FR25 | Validate that the chosen components are compatible when a study is built, with actionable errors. |
+| FR26 | Expose and record every policy value: no hidden numeric or behavioural constant. |
+| FR27 | Allow policies that boptim does not implement (for example Ax) as optional adapters honouring the same lifecycle. |
+| FR28 | Provide stopping criteria as components. |
 
 ---
 
-## 3. Technology stack
+## 3. Design principles
 
-| Layer | Technology | Why |
-|---|---|---|
-| Language / runtime | Python 3.11+ | Given. |
-| Optimization core | Ax (`ax-platform`, the `ax.api.client.Client` API and `ax.api.configs` parameter configs) | Search space definition (including conditional parameters), trial/experiment bookkeeping, a strong default generation strategy, built-in sensitivity analysis, prediction, Pareto-frontier/best-trial lookup, and JSON persistence. Covers most of FR1-FR4, FR6, FR7, FR9, FR11, FR14, FR15 largely "for free". |
-| Custom acquisition | BoTorch | Ax's automatic strategy selection is objective-driven (EI/NEI/UCB-family); it does not expose a pure-exploration, objective-independent acquisition function. BoTorch does (`qNegIntegratedPosteriorVariance` and friends), so FR5 is built as a custom acquisition layer on top of BoTorch models, orchestrated around Ax's data. See ADR-0001. |
-| Tensor / GP backend | PyTorch, GPyTorch | Transitive dependencies of Ax/BoTorch, not called directly except where the custom acquisition layer needs raw posterior access. |
-| Domain / config models | Pydantic v2 | Typed, validated, JSON-serializable-by-construction models for `boptim`'s own public types (parameters, objectives, constraints, trials), shaped to mirror `ax.api.configs` field-for-field where one exists. Keeps the public API decoupled from Ax's internal types (design philosophy #2). |
-| Packaging / environment | `uv` | See ADR-0002. |
-| Lint / format | `ruff` | Given. |
-| Type checking | `mypy --strict` | Given ("type hints mandatory everywhere"), strict mode chosen as the concrete default. |
-| Testing | `pytest` | Given. |
-| Logging | standard `logging` module | Given. |
-| Docs | `mkdocs` + `mkdocstrings` (Material theme) | Given. |
-| CI | GitHub Actions | Given. |
+These principles are normative. Each one exists because ignoring it has already caused a defect.
+
+### 3.1 Layers own one job; misplaced requests are flagged
+
+Every piece of behaviour belongs to exactly one layer (section 5.1). A request is first classified by the layer it belongs to. If it is phrased against a different layer (for example "add a prediction method to the optimizer" when prediction is a surrogate operation), the contributor MUST say so and propose the right place before implementing anything. Silently grafting a feature onto the nearest facade is a defect.
+
+### 3.2 Generalize the axis of variation; never implement only the letter
+
+Every request is an instance of something. Identify what varies (the axis), build the mechanism for the axis (a registry kind, a configuration field, a capability), and deliver the request as the first instance of that mechanism. State which other instances the mechanism now allows; do not implement them unless asked. A feature delivered as a one-off special case is a defect.
+
+### 3.3 Every choice is a registered component selected by configuration
+
+Any decision on which a reasonable user could want a different answer MUST be a named, registered component picked by configuration: model class, kernel, likelihood, transform, fitting procedure, acquisition function, acquisition optimizer, design, goal, analysis, stopping criterion, policy, repository, parameter kind, constraint kind, outcome kind. A class or default hard-wired inside library code to make such a choice is a defect. So is a swap point that exists only in a docstring: an abstract class that no code path actually uses to choose between implementations.
+
+### 3.4 No hard-coded policy values
+
+A *policy value* is any number, string, flag or heuristic that changes numerical results, performance or behaviour and could reasonably differ between users or problems: tolerances, budgets, sample counts, restart counts, iteration caps, thresholds, jitter and floors, seed-derivation constants, size limits, "use X when there are more than N" rules, default component names.
+
+- Every policy value MUST live in a typed configuration schema, with a documented meaning, unit and default. The default is written in exactly one place: the schema field.
+- Every policy value MUST be reachable by the caller through the study configuration. A constant buried in a function body, a module-level constant or a literal default in a function signature is a defect, even if it has a good name.
+- Every study MUST store its fully resolved configuration (all defaults materialized), so that a later change of a default never alters how an old study behaves.
+- Exempt are only structural constants that are part of a mathematical definition: 0, 1, -1 and 2 in formulas, tensor axis indices, and the bounds and midpoint of the unit cube. A structural constant that is not 0, 1, -1 or 2 carries an explicit marker with its reason (section 10.7).
+- The automated check (section 10.7) only finds numeric literals. Strings, booleans and rules hidden behind an allowed literal (for example `len(values) > 2` standing for "more than two values means ordered") are policy values too; review is the control for those.
+
+### 3.5 Reuse the engine; do not wrap or re-implement it
+
+If BoTorch, GPyTorch or Ax already does something, boptim registers a builder for it. boptim writes its own mathematics only when no engine class exists, and then as a native engine subclass. Do not mirror an engine class with a parallel abstraction, and do not invent engine API: names and signatures are verified against the installed versions (section 10.9).
+
+### 3.6 Fail early, and name the problem
+
+Compatibility between components is declared (needs and supports, section 5.12) and checked when a study is built, not discovered deep inside an engine call. Errors derive from one base class and name the component, the configuration field and a way to fix the problem. A study never silently changes its policy afterwards.
+
+### 3.7 Reproducible by construction
+
+One study seed feeds every stochastic component through a documented, stable derivation; no component uses a global random state. A registered component name is a permanent identifier: a change that alters results requires a new name (for example a `_v2` suffix), never an edit of the old one, so that saved studies keep meaning what they meant. Snapshots carry the resolved configuration, the library versions and a format version.
+
+### 3.8 Simple things easy, hard things possible
+
+There are three levels of use, and each can be entered without abandoning the study and persistence machinery of the level below: (1) declare a problem and a goal and take the default policy; (2) select and configure any component by name, in Python or in a configuration file; (3) write and register new components, or a whole policy.
+
+### 3.9 The domain is pure
+
+The domain layer contains data, validation and serialization only. It imports no machine-learning library, and it knows nothing about engines or adapters. Anything that maps domain objects to the vocabulary of an engine (for example Ax constraint strings) lives with that engine's adapter.
+
+### 3.10 Rule of two for seams
+
+A new registry kind, or an abstract interface, is created only when at least two concrete implementations exist or are required by a reference use case (section 7). One implementation behind an interface is speculation. A seam must also be real: the code that needs the choice MUST obtain it through the registry, never through a direct import of one implementation.
+
+### 3.11 Honest about uncertainty and limits
+
+Predictions state what they describe and whether observation noise is included. A surrogate fitted on very little data says so. The limits of a component are declared, not discovered by failure.
 
 ---
 
-## 4. Architecture
-
-### 4.1 Component overview
-
-```
-api/  BayesianOptimizer                     <- the single public entry point
-  |
-  +-- domain/         pure Pydantic models, zero ML dependencies
-  |
-  +-- backends/ax/     Ax Client adapter: search space, trial bookkeeping,
-  |                    default generation strategy, sensitivity, predictions,   --+
-  |                    Pareto frontier, JSON save/load                          |
-  |                                                                              +-- Ax / BoTorch /
-  +-- acquisition/     custom BoTorch acquisition layer: the alpha dial,        |   GPyTorch
-  |                    batch generation, multi-objective variant                |
-  |                                                                              |
-  +-- analysis/        sensitivity + prediction wrappers (Ax-backed, with      --+
-  |                    a non-Ax fallback for the BoTorch-only code path)
-  |
-  +-- persistence/     wraps Ax's own JSON save/load, adds reproducibility
-                       metadata boptim's domain layer needs on top
-```
-
-- **`domain`** has zero ML dependencies. It is what makes the library's public surface stable
-  even if the backend changes, and mirrors `ax.api.configs`' own parameter shapes field for
-  field wherever one exists (design philosophy #5).
-- **`backends/ax`** is the only place that imports Ax. It translates `domain` objects to and
-  from Ax's `Client`, and runs the *default* (non-alpha-controlled) generation strategy,
-  predictions, sensitivity analysis, Pareto-frontier/best-trial lookup, and persistence.
-- **`acquisition`** is the only place that imports BoTorch acquisition machinery directly. It
-  implements FR5 (the alpha dial) and its batch and multi-objective variants, working off the
-  fitted model that the Ax backend exposes.
-- **`analysis`** wraps whichever of Ax's built-in analyses we use, plus a fallback
-  implementation that does not depend on Ax's internals, so the library remains usable even in
-  a code path that only calls BoTorch directly.
-- **`persistence`** wraps Ax's own `Client.save_to_json_file`/`load_from_json_file` for the
-  Ax-backed state, and adds only what Ax's own snapshot does not carry: boptim's parameter
-  defaults/dependency metadata and `ReproducibilityMetadata` (FR11, FR12).
-
-### 4.2 Data flow for a typical call
-
-1. Caller constructs a `BayesianOptimizer`, either from a plain list of `Parameter`s (the
-   common case) or from an explicit `SearchSpace` + `Objective` (the case that needs
-   constraints or multi-objective weighting spelled out in full). See section 5.7.
-2. Caller calls `bo.tell(x, y)` zero or more times to inject prior data (FR3).
-3. Caller calls `bo.ask(n_points=..., alpha=...)`.
-   - If `alpha` is left at its default (see 4.3), `BayesianOptimizer` delegates to the Ax
-     backend's default generation strategy.
-   - Otherwise, `BayesianOptimizer` fits a surrogate model on its own trial history (in the
-     unit-cube encoding of `models/SearchSpaceEncoder`, ADR-0007), then hands that model to
-     the `acquisition` layer, which builds and optimizes the custom alpha-blended acquisition
-     function to produce `n_points` candidates. With fewer than two completed trials there is
-     nothing to fit, so space-filling points are suggested instead.
-   - The same path is taken with `alpha` left at its default when the search space holds a
-     `NonlinearConstraint` (section 4.6, ADR-0006).
-4. Caller evaluates the suggested point(s) (outside `boptim`, this is where a real experiment
-   or a training run happens) and calls `bo.tell(x, y)` again with the result(s).
-5. At any point, caller can call `bo.predict(x)`, `bo.parameterImportance()`,
-   `bo.paretoFront`, `bo.save(path)`, or drop to `bo.axClient`/`bo.fitModel()` for anything not
-   covered above (FR16).
-
-### 4.3 The exploration/exploitation dial (FR5)
-
-This is the part Ax does not give us for free, so it deserves its own explanation.
-
-Ax's automatic strategy selection picks a generation strategy based on the structure of the
-problem (search space size, number of trials so far, etc.), but the models it picks from are
-all objective-driven acquisition functions (Expected Improvement, Noisy EI, UCB and similar).
-There is no "ignore the objective, just reduce my uncertainty everywhere" mode exposed through
-the high-level API. BoTorch has exactly that building block
-(`qNegIntegratedPosteriorVariance`, an acquisition function designed purely for active
-learning / exploration), but wiring it into Ax requires stepping outside the high-level flow
-and writing a custom generation step, which is exactly why this project needs its own
-acquisition layer rather than relying on Ax alone.
-
-`boptim`'s acquisition layer defines two terms over the fitted surrogate model, for a
-candidate point `x`:
-
-- **Exploitation term:** the posterior mean at `x` (direction-adjusted for minimize/maximize),
-  min-max normalized over a Sobol-sampled reference set spanning the search space. At
-  `alpha = 0`, the acquisition function reduces to "go to the point the model currently
-  believes is best", independent of how uncertain that belief is. This is deliberately not
-  Expected Improvement, which already blends in some uncertainty-seeking behavior; keeping the
-  two extremes clean (mean-only vs. variance-only) is what makes `alpha` behave the way the
-  original spec describes it.
-- **Exploration term:** the posterior variance of the underlying function at `x` (the
-  epistemic uncertainty, without observation noise: the same quantity
-  `qNegIntegratedPosteriorVariance` integrates over the search space), normalized the same
-  way.
-
-The blended score is `score(x) = (1 - alpha) * exploitation(x) + alpha * exploration(x)`,
-maximized by BoTorch's `optimize_acqf`. For a batch of `n_points > 1`, points are chosen
-sequentially: each already-chosen point is passed back to the acquisition function as pending
-before the next is optimized. Pending points enter the two terms differently, because a GP
-treats them differently:
-
-- The exploration term is computed on a fantasy model conditioned on the pending points
-  (BoTorch's `fantasize`). A GP's posterior variance does not depend on the observed values, so
-  one fantasy suffices and the variance around a pending point collapses as if observed.
-- A mean-only exploitation term cannot be diversified that way: conditioning a GP on its own
-  predicted mean leaves the mean unchanged, so `alpha = 0` would return the same point
-  `n_points` times (breaking FR10). With pending points the exploitation term therefore becomes
-  the expected best outcome over the candidate and the pending points, estimated from joint
-  posterior samples (the `qSimpleRegret` construction). With no pending point it is exactly the
-  posterior mean, so a single candidate, and the first point of every batch, is still the pure
-  mean optimum. The consequence is that from the second point of a batch on, `alpha = 0` means
-  "best expected batch outcome", which credits uncertainty, rather than strictly "best
-  predicted mean".
-
-For multi-objective studies with no `Objective.weights`, the same blend applies, but the
-exploitation term becomes the expected hypervolume improvement over the model-predicted Pareto
-front, and the exploration term becomes the mean of the per-objective normalized posterior
-variances. `Objective.weights` controls *preference between objectives*; `alpha` controls
-*exploration vs. exploitation given that preference*. The two are orthogonal by design.
-
-Explicit weights scalarize the objectives (exactly as `toAxOptimizationConfig` hands Ax a
-weighted-sum objective), so a weighted multi-metric `Objective` is served by the
-single-objective function on the weighted sum of the direction-signed metrics, not by the
-hypervolume variant: scaling the axes of a hypervolume (with its reference point) leaves the
-best candidate unchanged, so it could not express a preference.
-
-### 4.4 Handling the full budget range (FR: implicit, from the "4-5 to thousands" requirement)
-
-- The number of purely space-filling initial points before model-based suggestions start maps
-  directly to Ax's own `Client.configure_generation_strategy(initialization_budget=...)`
-  (part of `AxBackend`'s setup), and can be set to `0` when the caller intends to seed the
-  study entirely through `tell()` and cannot afford to "spend" evaluations on a random design.
-  `configure_generation_strategy`'s other native knobs
-  (`method: Literal["quality", "fast", "random_search"]`, `initialize_with_center`,
-  `use_existing_trials_for_initialization`, `min_observed_initialization_trials`,
-  `allow_exceeding_initialization_budget`, `torch_device`) are exposed on `AxBackend`'s
-  constructor rather than reinvented; see section 5.3.
-- Below a configurable minimum number of observed points (a handful), a full marginal
-  likelihood fit of the GP hyperparameters is not reliable; the surrogate model factory falls
-  back to fixed/weakly-informative priors on lengthscales and noise rather than free
-  optimization, and `BayesianOptimizer` surfaces this state so a caller building a UI on top
-  can show an explicit "low-confidence model" indicator rather than silently reporting an
-  overconfident uncertainty estimate.
-- Scaling to very large budgets (thousands of points, where a plain GP's O(n^3) fitting cost
-  becomes a real bottleneck) is out of scope for V1, but the `models/` layer is a single,
-  swappable factory function specifically so that a sparse/scalable GP can be plugged in later
-  without touching the acquisition or API layers. See section 6.
-
-### 4.5 Conditional (hierarchical) parameters
-
-Prompted by Keras Tuner's `conditional_scope`/`parent_name` pattern: a parameter that only
-makes sense given another parameter's value (e.g. `num_filters` only matters when
-`model_type == "cnn"`). This is not boptim-invented: Ax's own
-`ax.api.configs.ChoiceParameterConfig` has a `dependent_parameters` field for exactly this,
-mapping a chosen value to the names of other parameters that become part of the active search
-space when that value is picked. `boptim`'s `Choice.dependent_parameters` (section 5.2) has
-the same name and the same shape, and `backends/ax/toAxSearchSpace.py` passes it straight
-through to Ax's `HierarchicalSearchSpace` rather than boptim maintaining its own graph of
-conditions. Keeping it declarative (a field on the config object) rather than callback-based
-(like Keras Tuner's `hp` object discovering the space by actually running a build function) is
-what keeps the search space fully static and inspectable, which is what `persistence/` needs
-to save and reload a study exactly, and what a future GUI would need to render a form that
-shows or hides fields as the user picks values.
-
-Honesty check on what this buys, kept from the previous draft because it is still true: Ax's
-own team describes the current default optimization behavior over a hierarchical search space
-as flattening it under the hood for model fitting rather than doing fully tree-aware
-optimization, noting that this "works shockingly well" empirically but is still an active area
-of their research. So: (1) the definition, persistence, and introspection of a conditional
-search space is now essentially free, a straight pass-through of an Ax field, buildable in
-Phase 1; (2) genuinely exploiting the structure during optimization (rather than just not
-crashing on it) is weaker today than a mature, flat search space, both in Ax's default
-strategy and in `boptim`'s own custom acquisition layer (section 4.3), which does not yet
-reason about `dependent_parameters` at all. Treat (1) as a Phase 1 item and (2) as a distinct,
-later roadmap item (section 6).
-
-### 4.6 Nonlinear constraints and the automatic acquisition-layer switch
-
-Two things can look like "a conditional" at first glance; this project treats them as
-genuinely different features rather than stretching one mechanism to cover both.
-
-- **Discrete, Choice-triggered activation**, i.e. Keras Tuner's own `conditional_scope`
-  example: `model_type == "mlp"` activates `hidden_units`, `model_type == "cnn"` activates
-  `num_filters`. This is section 4.5's `Choice.dependent_parameters`, already a direct
-  pass-through of an Ax field, and it is the minimum bar this project committed to. It is
-  already covered end to end; nothing below changes it or puts it at risk.
-- **A feasibility constraint across parameters expressed as an arbitrary expression**, e.g.
-  `var * x ** z <= n`. Here nothing stops existing: `var`, `x`, and `z` are all still active,
-  searched dimensions, the constraint just rules out some combinations of their values. Ax's
-  own `parameter_constraints` cannot express this: its constraint parser explicitly accepts
-  linear expressions only and rejects anything else. BoTorch's `optimize_acqf` can, through
-  its `nonlinear_inequality_constraints` argument, but only inside `boptim`'s own custom
-  acquisition layer (section 4.3), not Ax's default generation strategy.
-
-`NonlinearConstraint` (section 5.2) is this second thing, kept as a string expression rather
-than a raw Python callable specifically so a study that uses one still round-trips through
-`JsonStudyRepository` (FR11, FR12) like every other domain object; it is parsed and evaluated
-by a small, restricted expression evaluator (arithmetic and a short allowlist of math
-functions), never Python's own `eval`.
-
-Its presence changes `BayesianOptimizer.ask()`'s behavior (ADR-0006): calling `ask()` with
-`alpha=None` would normally delegate to Ax's no-manual-tuning default strategy (FR4), but Ax
-cannot enforce a `NonlinearConstraint`, and neither can it enforce an equality
-`LinearConstraint` (`comparator="="`: its `parameter_constraints` accept inequalities only,
-ADR-0008). Every `Constraint` reports this through `requires_custom_acquisition_layer`. When any
-constraint does, in that case `boptim` instead forces its own custom
-acquisition layer with a fixed default `alpha` and logs a warning explaining why, rather than
-silently returning candidates that might violate a constraint the caller declared. Calling
-`ask()` with `alpha` passed explicitly already uses the custom layer, so nothing changes and no
-warning fires; the switch only ever affects the implicit, default-strategy path.
-
-### 4.7 Ax capabilities this draft knowingly does not wrap yet
-
-Read against Ax's own API reference (https://ax.readthedocs.io/en/stable/api.html) while
-revising this document. These are real, existing Ax features that are deliberately left out of
-the V1 signatures in section 5, not features that were missed:
-
-| Ax capability | What it would give `boptim` | Why deferred |
-|---|---|---|
-| `IRunner` / `IMetric` + `Client.run_trials()` | A closed-loop mode: hand `boptim` an objective function once, let it run the whole ask/tell/run loop internally, instead of the caller driving `ask()`/`tell()` by hand. Natural fit for the ML side of the audience. | `ask`/`tell` covers both audiences (lab and ML) uniformly; closed-loop is an additive convenience on top, not something either audience is blocked without. Candidate for a `BayesianOptimizer.optimize(objective_fn, n_trials)` helper post-V1. |
-| `StorageConfig` (SQL database) | An alternative to `JsonStudyRepository` for teams that want a shared database instead of files. | `StudyRepository` is already an interface for exactly this reason (section 5.6); a DB-backed implementation is additive, not a redesign. |
-| `Client.attach_baseline` + relative `OutcomeConstraint` | Expressing an outcome constraint as a multiple of a baseline/status-quo trial (e.g. "qps >= 0.95 * baseline") instead of an absolute bound. | `OutcomeConstraint.relative` (section 5.2) already reserves the field; wiring it to `attach_baseline` is a small, later addition, not a design change. |
-| `Client.attach_data` (partial/intermediate data) | Recording an in-progress result before a trial fully completes, useful for early-stopping. | Not needed by the ask/tell pattern this project is built around; `tell()` assumes a trial is complete. |
-| `mark_trial_failed` / `mark_trial_abandoned` / `mark_trial_early_stopped` | Fuller trial lifecycle management. | `boptim`'s trials are recorded once they are known; failure/abandonment handling matters more for the closed-loop mode above than for manual `tell()`. |
-| `simplify_parameter_changes` / `pruning_target_parameterization` (BONSAI) | Minimizing how much changes between consecutive suggestions, which matters when a human has to physically reconfigure equipment between trials. | Directly relevant to the lab use case; a strong candidate for Phase 3, listed here so it is visibly not forgotten rather than silently absent. |
-
-### 4.8 Key decisions (ADRs)
-
-Full ADRs live under `docs/adr/`, one file per decision, following the format below. Three are
-written out in full here as the decisions with the most day-to-day impact; the rest are listed
-with the context that should seed them when they are written, following the same format.
-
-#### ADR-0001: Hybrid Ax + BoTorch architecture
-
-**Status:** Accepted
-**Date:** 2026-09-23
-**Deciders:** [project owner]
-
-**Context**
-
-The project needs (a) a robust, low-maintenance implementation of the standard building
-blocks of Bayesian optimization (search space definition, trial bookkeeping, a
-no-manual-tuning default strategy, sensitivity analysis, persistence), and (b) a genuinely
-custom, objective-independent exploration/exploitation control (FR5) that is not exposed by
-any existing high-level BO library.
-
-**Decision**
-
-Use Ax's `Client` API for everything in (a), and a custom BoTorch-based acquisition layer for
-(b), connected through a fitted-model handoff rather than through Ax's generation-strategy
-plugin mechanism.
-
-**Options considered**
-
-| Dimension | Ax only | BoTorch only | Hybrid (chosen) |
-|---|---|---|---|
-| Effort for FR1-FR4, FR6, FR7, FR9, FR11, FR14, FR15 | Low (native) | High (all hand-rolled) | Low (native) |
-| Effort for FR5 (alpha dial) | High (fighting the framework) | Low (native building blocks) | Low (native building blocks) |
-| Long-term maintenance | Low | High | Medium |
-| Risk from upstream API churn | Medium (already changed once) | Low (BoTorch is lower-level, more stable) | Medium, mitigated by the domain-layer boundary (design philosophy #2) |
-
-**Trade-off analysis**
-
-Ax-only would mean either not delivering FR5 properly, or fighting Ax's generation-strategy
-internals to inject a custom acquisition function, which is possible but brittle and poorly
-documented for this specific use case. BoTorch-only would mean re-implementing trial
-bookkeeping, persistence, and sensitivity analysis that Ax already provides solidly. The
-hybrid keeps each library doing what it is strongest at.
-
-**Consequences**
-
-- `backends/ax` is the only module allowed to import from `ax.*`.
-- `acquisition` is the only module allowed to build custom `botorch.acquisition.*` subclasses.
-- Any future backend swap (e.g. moving off Ax entirely) only requires rewriting
-  `backends/ax` and the parts of `acquisition` that read a fitted model, not `domain` or `api`.
-
-**Action items**
-
-1. [ ] Implement `backends/ax/AxBackend.py` against the pinned Ax version.
-2. [ ] Implement `acquisition/ExplorationExploitationAcquisition.py` against the pinned
-   BoTorch version.
-3. [ ] Pin compatible Ax/BoTorch/PyTorch/GPyTorch versions together in `pyproject.toml`.
-
-#### ADR-0002: `uv` for project and dependency management
-
-**Status:** Accepted
-**Date:** 2026-09-23
-**Deciders:** [project owner]
-
-**Context**
-
-The project has a heavy, sometimes fragile dependency tree (PyTorch, BoTorch, Ax, GPyTorch),
-several of which have platform-specific wheels. FR12 explicitly requires reproducibility. The
-project owner's default on other projects is `setuptools`.
-
-**Decision**
-
-Use `uv` for environment creation, dependency resolution, locking, and running dev commands
-(`uv run`, `uv sync`). Use a simple build backend (`uv_build`, or `hatchling` if an Ax/BoTorch
-edge case needs it) rather than `setuptools`, since this is a pure-Python package with no C
-extensions to compile.
-
-**Options considered**
-
-`uv` and `setuptools` are not strictly alternatives: `setuptools` is a *build backend* (it
-knows how to turn source into a wheel/sdist); `uv` is a *project and dependency manager*
-(virtual environments, dependency resolution, lockfiles, Python version management) that can
-itself use `setuptools`, `hatchling`, or its own `uv_build` as the build backend underneath.
-The real comparison is "pip + setuptools as the whole day-to-day workflow" vs. "`uv` as the
-whole day-to-day workflow".
-
-| Dimension | pip + setuptools workflow | `uv` workflow (chosen) |
-|---|---|---|
-| Install speed on a torch/botorch-sized dependency tree | Minutes | Seconds to low tens of seconds |
-| Reproducible installs | Requires adding `pip-tools` or similar; no native lockfile | Native, cross-platform `uv.lock` |
-| Virtual env + Python version management | Separate tools (`venv`, `pyenv`) | Built in |
-| Maturity | 20+ years, universal | Newer (~2 years), but backed by Astral (same team as `ruff`) and already a common choice for ML projects |
-| Handles C extensions / Cython | Yes (this is `setuptools`' particular strength) | Not needed here: `boptim` is pure Python |
-
-**Trade-off analysis**
-
-For a pure-Python package, `setuptools`' specific strength (compiled extensions) is not
-relevant here, so it offers no advantage that matters for this project. `uv`'s advantages
-(install speed, native lockfile) map directly onto two things this project actually has: a
-heavy dependency tree and an explicit reproducibility requirement. If `setuptools` is preferred
-for familiarity, it can still be used as just the build backend under `uv`
-(`uv init --build-backend setuptools`) without giving up any of `uv`'s other benefits.
-
-**Consequences**
-
-- Contributors run `uv sync` once instead of manually managing a virtualenv.
-- `uv.lock` is committed to version control.
-- CI uses `uv`'s official GitHub Action instead of a manual `pip install` step.
-
-**Action items**
-
-1. [ ] `uv init`, confirm the pinned dependency set resolves cleanly.
-2. [ ] Commit `uv.lock`.
-3. [ ] Update the CI workflow to use `astral-sh/setup-uv`.
-
-#### ADR-0003 (to write): Pydantic domain models decoupled from Ax's internal types
-
-Context to seed it: design philosophy #2 (section 1.3) and the fact that Ax's own public API
-surface has already changed once. Follow the ADR-0001 format above.
-
-#### ADR-0004 (to write): JSON as the persistence format, wrapping Ax's own save/load
-
-Context to seed it: FR11/FR12, and that `Client.save_to_json_file`/`load_from_json_file`
-already serialize the Ax-backed state correctly; `JsonStudyRepository` (section 5.6) wraps
-that rather than reinventing it, and only adds what Ax's own snapshot does not carry. Follow
-the ADR-0001 format above.
-
-#### ADR-0005: Escape hatches to Ax and BoTorch
-
-**Status:** Accepted
-**Date:** 2026-09-23
-**Deciders:** [project owner]
-
-**Context**
-
-`BayesianOptimizer` is a deliberately high-level facade (design philosophy #2): it does not,
-and should not, expose every capability of Ax or BoTorch individually. Some callers will need
-something the facade does not cover (section 4.7 lists several concrete, real examples). A
-facade with no way out forces those callers to either fork `boptim` or drop it entirely for a
-whole project just to reach one feature underneath it.
-
-**Decision**
-
-`BayesianOptimizer` exposes two escape hatches directly: `axClient` (the live
-`ax.api.client.Client` instance backing this optimizer, when the backend is `AxBackend`) and
-`fitModel()` (the current fitted BoTorch model). Both are first-class, documented parts of the
-public API, not private/internal attributes a caller has to know to reach into.
-
-**Options considered**
-
-| Option | Description | Trade-off |
-|---|---|---|
-| No escape hatch | Only what `BayesianOptimizer` explicitly wraps is reachable | Simplest surface, but strands any caller who needs one more thing Ax or BoTorch already has |
-| Escape hatch via private attribute | e.g. `bo._backend._client`, undocumented | Technically possible in Python, but an undocumented private attribute is not a supported contract; it can change without notice |
-| Escape hatch as a public, documented property (chosen) | `bo.axClient`, `bo.fitModel()` | A little more public surface to keep stable, in exchange for never trapping a caller behind the facade |
-
-**Trade-off analysis**
-
-The cost is that `axClient`'s and `fitModel()`'s own stability is now, transitively, Ax's and
-BoTorch's stability, not `boptim`'s. That is an explicit, accepted trade: it is scoped to
-callers who opt into using it, and it does not weaken any guarantee the rest of the public API
-makes. The alternative (no escape hatch) trades a cleaner-looking API for a real risk of
-callers hitting a wall and abandoning the library for their whole project over one missing
-capability, which is a worse outcome for a library meant to be "accessible to all" (section
-1.1).
-
-**Consequences**
-
-- `axClient` raises `TypeError` (not `None`) when `backend` is not an `AxBackend`, since
-  silently returning `None` would push the "is this available" check onto every caller instead
-  of failing where the mismatch actually is.
-- `fitModel()` is available regardless of backend, since it is defined at the
-  `OptimizationBackend` interface level (section 5.3), not Ax-specific.
-- Anything reached through `axClient` is, by definition, outside what `boptim` validates or
-  keeps in sync with its own domain objects; this is documented on the property itself
-  (section 5.7), not just here.
-
-**Action items**
-
-1. [ ] Add `axClient` and `fitModel()` to `BayesianOptimizer` in the same change that
-   implements `AxBackend` (Phase 1), not as an afterthought.
-2. [ ] Document at least one worked example of each in `examples/` (section 5.1).
-
-#### ADR-0006: `NonlinearConstraint` forces the custom acquisition layer, with a warning
-
-**Status:** Accepted
-**Date:** 2026-09-23
-**Deciders:** [project owner]
-
-**Context**
-
-FR17 (a feasibility constraint across parameters expressed as an arbitrary expression, e.g.
-`var * x ** z <= n`) cannot be expressed through Ax's own `parameter_constraints`, confirmed
-linear-only. BoTorch's `optimize_acqf` supports it directly via
-`nonlinear_inequality_constraints`, but only within `boptim`'s own custom acquisition layer
-(section 4.3), not Ax's default generation strategy (FR4). `BayesianOptimizer.ask()` with
-`alpha=None` normally means "use the default strategy".
-
-**Decision**
-
-When `SearchSpace` contains one or more `NonlinearConstraint` and `ask()` is called with
-`alpha=None`, `boptim` automatically switches to its own custom acquisition layer instead of
-Ax's default strategy, forcing `alpha` to a fixed default (`DEFAULT_ALPHA_WHEN_FORCED = 0.0`),
-and logs a warning stating that the switch happened and why. `alpha` passed explicitly already
-uses the custom layer, so no switch or warning is needed in that case.
-
-**Options considered**
-
-| Option | Description | Trade-off |
-|---|---|---|
-| Silently ignore the constraint on the default path | `ask(alpha=None)` behaves exactly as it would without the `NonlinearConstraint` present | Simplest, but silently returns candidates that may violate a constraint the caller explicitly declared: a correctness bug wearing a "no manual tuning needed" feature's clothes |
-| Raise an error instead of switching | `ask(alpha=None)` raises if a `NonlinearConstraint` is present, forcing the caller to pass `alpha` explicitly | Never silently wrong, but breaks FR4's promise for a caller who has no opinion on `alpha` and just wants the default path to work |
-| Automatically switch layer and warn (chosen) | `alpha` defaults to a fixed value, a warning is logged, `ask()` still returns | Never silently violates the constraint, never blocks the caller who wants the simple path; costs a small amount of "spooky action": the effective strategy for a given call depends on the search space's contents, not only on that call's own arguments |
-
-**Trade-off analysis**
-
-A raised error is honest but actively defeats FR4's own goal (a caller with no opinion on
-tuning should still get a good, working default); silently ignoring the constraint is worse in
-every way, since it produces wrong answers without saying so. The switch-and-warn is the only
-option that keeps FR4's promise (`ask()` still works with no arguments) without breaking the
-promise a `NonlinearConstraint` itself makes (returned candidates satisfy it).
-
-**Consequences**
-
-- `ask()`'s behavior for a given `(n_points, alpha)` pair is not fully determined without also
-  knowing the search space's constraints; this is documented on `ask()` itself (section 5.7),
-  not left implicit.
-- `DEFAULT_ALPHA_WHEN_FORCED` is a named constant, not a number buried in the switch logic, so
-  it is easy to find and reconsider later.
-- Every switch is logged at `WARNING` level through the standard `logging` module (section
-  10's own rule), never printed, never silent.
-
-**Action items**
-
-1. [ ] Implement the search-space check and the forced switch in `BayesianOptimizer.ask()`,
-   Phase 2, alongside the custom acquisition layer it depends on.
-2. [ ] Add a test asserting the warning fires exactly when `alpha=None` and a
-   `NonlinearConstraint` is present, and never otherwise.
-3. [ ] Add `examples/nonlinear_constraint.py` demonstrating both the constraint and the switch.
+## 4. Glossary
+
+These terms are canonical. Do not invent new names for the same concepts.
+
+- **Problem**: a search space together with the outcomes that are measured.
+- **Search space**: the parameters and the parameter constraints.
+- **Parameter**: one dimension of the search space. Types: range (real or integer, bounds, optional step and log scaling), choice (ordinal or categorical, optionally with dependent parameters) and derived (computed from other parameters, never searched). Sugar constructors (real, integer, categorical, boolean, fixed) build these types and are not stored types.
+- **Constraint** (parameter constraint): a condition on the input parameters. Types: linear and nonlinear. Constraints on observed outcomes belong to a goal, not to the search space.
+- **Outcome**: a measured quantity, with a name and a type (its *outcome kind*).
+- **Outcome kind**: how an outcome's values are validated and which surrogates suit it (continuous, binary, ...).
+- **Trial**: one parameterization with an identity and a state. States: pending (suggested, not yet reported), completed (has an observation), failed (the evaluation did not produce one; carries a reason) and abandoned (withdrawn by the caller).
+- **Observation**: the values of the outcomes for a completed trial, with optional per-outcome noise standard deviations.
+- **Study**: the object a caller drives. It owns the problem, the goal, the policy and the trial history, and offers ask, tell, fail, abandon, attach, analyses, stopping checks, surrogate access and save/load.
+- **Goal**: a typed statement of what the caller wants to know or decide (optimize, level set, explore, ...). It is configuration, not an algorithm: it parameterizes acquisitions and analyses and supplies default recipes.
+- **Surrogate**: a probabilistic model of the outcomes as a function of the parameters, fitted on the observations (a Gaussian process by default), together with the encoding that binds it to a problem.
+- **Acquisition**: a score over candidate points, built from a surrogate, a goal and the pending points. Higher means more worth evaluating.
+- **Acquisition optimizer**: the procedure that searches the encoded space for the points that maximize an acquisition, subject to the constraints.
+- **Design**: a procedure that proposes points without a model (space-filling or random), always satisfying the constraints.
+- **Policy**: the component that decides which parameterizations to evaluate next. A *composed* policy is made of a design, a surrogate, an acquisition and an acquisition optimizer. An *opaque* policy is any object honouring the policy contract (random search, an Ax adapter, user code).
+- **Recipe**: the default composed-policy configuration that a goal proposes when the caller gives none.
+- **Analysis**: a computation over the study state producing a typed, serializable result (best point, Pareto front, level-set estimate, parameter importance, diagnostics). An analysis never mutates the study.
+- **Stopping criterion**: a component that looks at the study state and answers continue or stop, with a reason.
+- **Component**: any registered, named, configurable piece (a surrogate, an acquisition, a goal, ...). Components belong to a *kind*.
+- **Kind**: a category of components that share a contract and a registry (surrogate, acquisition, goal, ...).
+- **Registry**: the table of the components of one kind, keyed by name.
+- **Builder**: what a registry entry uses to create the native object of a component from a validated configuration and a build context.
+- **Build context**: the read-only information a builder receives (problem, encoder, data tensors, goal, pending points, random generator, runtime settings, and the components it depends on).
+- **Component configuration**: the typed, validated settings of one component, discriminated by its `type` name. Nested components use the same form.
+- **Resolved configuration**: a configuration with every default materialized; what snapshots store.
+- **Capability tag**: a short string from a documented vocabulary naming a feature (for example `posterior:gaussian` or `space:categorical`). Participants declare tags they **need** and tags they **support**.
+- **Plugin**: an external package that registers components, discovered through an entry point or loaded explicitly.
+- **Encoding**: the mapping between parameterizations and tensors in the unit cube, on which surrogates, acquisitions and optimizers work.
+- **Snapshot**: the single JSON document that stores a study.
+- **Seam**: a place where one implementation can be swapped for another (in practice, a registry kind).
+- **Reference use case**: an entry of the acceptance matrix of section 7.
 
 ---
 
-## 5. Detailed design
-
-This section names the main files, classes, methods and functions with typed signatures.
-Docstrings are shortened to one line here for space; the actual code requires full
-Google-style docstrings per section 10. Signatures are Python 3.11+ (`X | None`, built-in
-generics). File names follow section 10's naming rule: a file holding exactly one public
-symbol is named exactly like that symbol (`BayesianOptimizer.py`, `toAxSearchSpace.py`), not a
-lower-cased version of it.
-
-### 5.1 Package layout
-
-```
-boptim/
-├── pyproject.toml
-├── README.md
-├── docs/
-│   ├── index.md
-│   ├── contributing.md              # incl. the naming-convention rationale from section 10
-│   ├── changelogs/
-│   │   ├── CHANGELOG.md             # running index: latest entries + links to each version below
-│   │   ├── changelog-v0.1.0.md
-│   │   └── changelog-v0.2.0.md      # one immutable file per released version, never edited after
-│   │                                 # release, same "new file, don't edit history" spirit as the
-│   │                                 # ADRs (section 10)
-│   └── adr/
-│       ├── 0001-hybrid-ax-botorch-architecture.md
-│       ├── 0002-uv-over-setuptools.md
-│       ├── 0003-pydantic-domain-models.md
-│       ├── 0004-json-persistence-format.md
-│       ├── 0005-escape-hatches-to-ax-and-botorch.md
-│       └── 0006-nonlinear-constraint-forces-custom-layer.md
-├── examples/
-│   ├── lab_experiment.py            # a physical-experiment campaign, small n_trials, alpha swept
-│   ├── ml_hyperparameter_search.py  # a training-loop objective, larger n_trials
-│   ├── conditional_search_space.py  # Choice.dependent_parameters end to end
-│   ├── escape_hatch.py              # axClient and fitModel() used directly, ADR-0005
-│   └── nonlinear_constraint.py      # NonlinearConstraint + the ask() switch/warning, ADR-0006
-├── scripts/
-│   ├── new_adr.py                   # scaffolds docs/adr/NNNN-title.md from the ADR-0001 template
-│   ├── cut_release.py               # creates docs/changelogs/changelog-vX.Y.Z.md, updates
-│   │                                 # CHANGELOG.md's index, bumps the version in pyproject.toml
-│   └── check_naming_convention.py   # CI helper: flags a file whose name does not match its
-│                                     # single public symbol, catching what ruff's N-rules don't
-├── src/boptim/
-│   ├── __init__.py                  # re-exports the public surface (BayesianOptimizer, parameter
-│   │                                 # classes, Objective, Metric, constraints, ...); exempt from
-│   │                                 # the file-naming rule, like every Python dunder file
-│   ├── domain/
-│   │   ├── parameters/
-│   │   │   ├── Parameter.py         # Parameter (ABC)
-│   │   │   ├── Range.py             # Range: mirrors ax.api.configs.RangeParameterConfig
-│   │   │   ├── Real.py              # Real(Range): sugar, parameter_type="float"
-│   │   │   ├── Integer.py           # Integer(Range): sugar, parameter_type="int"
-│   │   │   ├── Choice.py            # Choice: mirrors ax.api.configs.ChoiceParameterConfig,
-│   │   │   │                        # dependent_parameters included
-│   │   │   ├── Categorical.py       # Categorical(Choice): sugar, parameter_type="str"
-│   │   │   ├── Boolean.py           # Boolean(Choice): sugar, values=[True, False]
-│   │   │   ├── Fixed.py             # Fixed(Choice): sugar, a single-value Choice
-│   │   │   └── Derived.py           # Derived: mirrors ax.api.configs.DerivedParameterConfig
-│   │   ├── constraints/
-│   │   │   ├── Constraint.py        # Constraint (ABC), parameter-level
-│   │   │   ├── LinearConstraint.py  # LinearConstraint
-│   │   │   ├── NonlinearConstraint.py  # NonlinearConstraint, FR17
-│   │   │   └── validateExpression.py   # the restricted expression grammar
-│   │   ├── SearchSpace.py
-│   │   ├── Metric.py
-│   │   ├── Objective.py             # handles N >= 1 metrics, weights, outcome_constraints uniformly
-│   │   ├── OutcomeConstraint.py     # metric-level constraint, mirrors Ax's outcome_constraints
-│   │   ├── Trial.py
-│   │   └── StudySnapshot.py         # full persisted state
-│   ├── backends/
-│   │   ├── OptimizationBackend.py   # ABC
-│   │   ├── PredictionUnavailableError.py
-│   │   └── ax/
-│   │       ├── AxBackend.py
-│   │       ├── toAxSearchSpace.py
-│   │       ├── fromAxSearchSpace.py
-│   │       └── toAxOptimizationConfig.py
-│   ├── models/
-│   │   ├── buildSurrogateModel.py
-│   │   ├── encodeTrials.py                      # trials -> training tensors
-│   │   ├── predictWithModel.py                  # (mean, sem) of a fitted model at a point
-│   │   ├── SearchSpaceEncoder.py                # SearchSpace <-> unit cube, ADR-0007
-│   │   ├── ParameterEncoding.py                 # one parameter's column layout
-│   │   └── compileExpression.py                 # restricted expression -> torch function
-│   ├── acquisition/
-│   │   ├── AcquisitionStrategy.py               # ABC
-│   │   ├── AlphaAcquisitionStrategy.py          # the implementation behind ask(alpha=...)
-│   │   ├── ExplorationExploitationAcquisition.py
-│   │   ├── MultiObjectiveExplorationExploitationAcquisition.py
-│   │   ├── EncodedConstraints.py                # constraints on the encoded tensor
-│   │   ├── sampleFeasibleEncoded.py             # constraint-satisfying space-filling draws
-│   │   ├── modelParetoFront.py
-│   │   └── toBotorchNonlinearConstraints.py     # FR17, ADR-0006
-│   ├── analysis/
-│   │   ├── SensitivityAnalyzer.py               # ABC
-│   │   ├── SobolSensitivityAnalyzer.py
-│   │   └── PredictionResult.py
-│   ├── persistence/
-│   │   ├── StudyRepository.py                   # ABC
-│   │   ├── JsonStudyRepository.py               # wraps Client.save_to_json_file/load_from_json_file
-│   │   └── ReproducibilityMetadata.py
-│   ├── api/
-│   │   └── BayesianOptimizer.py                 # the public facade
-│   └── logging_config.py                        # module, not a single symbol: kept snake_case
-│                                                  # (see section 10's exception for this case)
-└── tests/
-    ├── unit/                             # mirrors src/boptim/*
-    └── integration/
-        └── test_end_to_end.py            # dummy objective, full tell/ask/save/load loop
-```
-
-### 5.2 Domain layer
-
-```python
-# domain/parameters/Parameter.py
-class Parameter(ABC):
-    """Base class for every kind of search space parameter."""
-
-    name: str
-    default: float | int | str | bool | None
-
-
-# domain/parameters/Range.py
-class Range(Parameter):
-    def __init__(
-        self,
-        name: str,
-        bounds: tuple[float, float],
-        parameter_type: Literal["float", "int"] = "float",
-        step_size: float | None = None,
-        scaling: Literal["linear", "log"] | None = None,
-        default: float | int | None = None,
-    ) -> None:
-        """A continuous or integer-stepped dimension.
-
-        Field names (bounds, parameter_type, step_size, scaling) match
-        ax.api.configs.RangeParameterConfig directly: this class is a typed
-        pass-through, not a reinvention. See backends/ax/toAxSearchSpace.py.
-        """
-
-
-# domain/parameters/Real.py
-class Real(Range):
-    def __init__(
-        self,
-        name: str,
-        min_value: float,
-        max_value: float,
-        step_size: float | None = None,
-        scaling: Literal["linear", "log"] | None = None,
-        default: float | None = None,
-    ) -> None:
-        """Real(name, min_value, max_value) is sugar for
-        Range(name, (min_value, max_value), parameter_type="float").
-        A class, not a function, on purpose: it is meant to be called like
-        a type constructor (Real("x", 0.0, 1.0)), so it follows the
-        CamelCase class-naming rule, not the camelCase function one.
-        """
-
-
-# domain/parameters/Integer.py
-class Integer(Range):
-    def __init__(
-        self,
-        name: str,
-        min_value: int,
-        max_value: int,
-        step_size: int | None = None,
-        scaling: Literal["linear", "log"] | None = None,
-        default: int | None = None,
-    ) -> None:
-        """Integer(name, min_value, max_value) is sugar for
-        Range(name, (min_value, max_value), parameter_type="int")."""
-
-
-# domain/parameters/Choice.py
-class Choice(Parameter):
-    def __init__(
-        self,
-        name: str,
-        values: list[float] | list[int] | list[str] | list[bool],
-        parameter_type: Literal["float", "int", "str", "bool"],
-        is_ordered: bool | None = None,
-        dependent_parameters: Mapping[float | int | str | bool, Sequence[str]] | None = None,
-        default: float | int | str | bool | None = None,
-    ) -> None:
-        """A discrete dimension: ordinal or categorical, controlled by is_ordered.
-
-        Field names and shape mirror ax.api.configs.ChoiceParameterConfig
-        exactly, dependent_parameters included: a chosen value mapped to
-        the names of other Parameters that only become part of the active
-        search space when that value is picked. This is Ax's own mechanism
-        for conditional/hierarchical search spaces (FR14); boptim exposes
-        it as-is rather than inventing a parallel one. See section 4.5.
-        """
-
-
-# domain/parameters/Categorical.py
-class Categorical(Choice):
-    def __init__(
-        self,
-        name: str,
-        categories: list[str],
-        dependent_parameters: Mapping[str, Sequence[str]] | None = None,
-        default: str | None = None,
-    ) -> None:
-        """Categorical(name, categories) is sugar for
-        Choice(name, categories, parameter_type="str", is_ordered=False)."""
-
-
-# domain/parameters/Boolean.py
-class Boolean(Choice):
-    def __init__(self, name: str, default: bool | None = None) -> None:
-        """Boolean(name) is sugar for
-        Choice(name, [True, False], parameter_type="bool", is_ordered=False)."""
-
-
-# domain/parameters/Fixed.py
-class Fixed(Choice):
-    def __init__(self, name: str, value: float | int | str | bool) -> None:
-        """A constant, non-optimized value that stays part of the declared
-        parameterization (e.g. a setting recorded on every trial but never
-        varied), matching Keras Tuner's Fixed.
-
-        ax.api.configs has no separate FixedParameterConfig in the current
-        Client API (only Range, Choice, Derived), though Ax's lower-level
-        parameter_from_config() utility still names FixedParameter as a
-        concept internally. The closest native equivalent, and what this
-        maps to in backends/ax, is a single-value Choice; that mapping,
-        not a reimplemented "fixed" concept, is what this class is.
-        """
-
-
-# domain/parameters/Derived.py
-class Derived(Parameter):
-    def __init__(
-        self,
-        name: str,
-        expression: str,
-        parameter_type: Literal["float", "int", "str", "bool"],
-    ) -> None:
-        """A read-only quantity computed from other parameters through an
-        expression string (e.g. "a + b"), not itself searched over.
-
-        Mirrors ax.api.configs.DerivedParameterConfig directly. Useful for
-        referencing a computed quantity in a LinearConstraint or reading it
-        back from a Trial without recomputing it outside boptim.
-        """
-
-
-# domain/constraints/Constraint.py
-class Constraint(ABC):
-    """Base class for parameter-level constraints (see OutcomeConstraint
-    for metric-level ones, which are not a Constraint subclass since they
-    apply to a different thing entirely: an observed value, not a
-    decision variable)."""
-
-
-# domain/constraints/LinearConstraint.py
-class LinearConstraint(Constraint):
-    def __init__(
-        self,
-        coefficients: dict[str, float],
-        bound: float,
-        comparator: Literal["<=", ">=", "="],
-    ) -> None:
-        """sum(coefficients[name] * value[name]) <comparator> bound.
-
-        Rendered to the string expression Client.configure_experiment's
-        parameter_constraints expects (e.g. "a + b + c = 1.0") by
-        backends/ax/toAxSearchSpace.py; kept as a typed, validated object
-        here rather than asking the caller to hand-write Ax's string
-        mini-language directly.
-
-        Example: a 3-component mixture summing to 1 is
-        LinearConstraint({"a": 1.0, "b": 1.0, "c": 1.0}, bound=1.0, comparator="=").
-
-        Ax's parameter_constraints accept inequalities only, so a "=" constraint is
-        not given to Ax: it is enforced by boptim's own acquisition layer, and
-        requires_custom_acquisition_layer is True for it (ADR-0008).
-        """
-
-
-# domain/constraints/NonlinearConstraint.py
-class NonlinearConstraint(Constraint):
-    def __init__(
-        self,
-        expression: str,
-        comparator: Literal["<=", ">="],
-        bound: float,
-    ) -> None:
-        """A feasibility constraint across parameters expressed as an
-        arbitrary expression, e.g. NonlinearConstraint("var * x ** z", "<=", n).
-        FR17.
-
-        A string, not a Python callable, specifically so a study using one
-        still round-trips through JsonStudyRepository (FR11, FR12) like
-        every other domain object. Parsed and evaluated by a small,
-        restricted expression evaluator (arithmetic and a short allowlist
-        of math functions), never Python's own eval.
-
-        No "=" comparator: an exact nonlinear equality is a measure-zero
-        constraint a numerical optimizer cannot meaningfully target, unlike
-        LinearConstraint's "=" which BoTorch handles as a true linear
-        equality constraint.
-
-        Not expressible through Ax's own parameter_constraints (confirmed
-        linear-only); rendered instead to a BoTorch
-        nonlinear_inequality_constraints callable by
-        acquisition/toBotorchNonlinearConstraints.py, and enforced only
-        when boptim's own acquisition layer runs. See section 4.6, ADR-0006.
-        """
-
-
-# domain/SearchSpace.py
-class SearchSpace:
-    def __init__(
-        self,
-        parameters: Sequence[Parameter],
-        constraints: Sequence[Constraint] | None = None,
-    ) -> None: ...
-
-    def addParameter(self, parameter: Parameter) -> None: ...
-
-    def addConstraint(self, constraint: Constraint) -> None: ...
-
-    @property
-    def parameter_names(self) -> list[str]:
-        """Cheap (list comprehension over an already-held list): snake_case."""
-
-
-# domain/Metric.py
-class Metric:
-    def __init__(self, name: str, minimize: bool) -> None:
-        """One measured quantity and its optimization direction."""
-
-
-# domain/OutcomeConstraint.py
-class OutcomeConstraint:
-    def __init__(
-        self,
-        metric_name: str,
-        bound: float,
-        comparator: Literal["<=", ">="],
-        relative: bool = False,
-    ) -> None:
-        """A constraint on an observed metric rather than on a parameter
-        (e.g. "qps >= 100"), matching what Client.configure_optimization's
-        own outcome_constraints expects (FR15). Lives alongside Objective,
-        not inside SearchSpace, because it constrains an observed outcome,
-        not a decision variable.
-
-        relative=True expresses the bound as a multiple of a baseline
-        trial rather than an absolute value; wiring this to
-        Client.attach_baseline is listed as deferred in section 4.7, this
-        field just reserves the shape for it.
-        """
-
-
-# domain/Objective.py
-class Objective:
-    def __init__(
-        self,
-        metrics: Sequence[Metric],
-        weights: Sequence[float] | None = None,
-        outcome_constraints: Sequence[OutcomeConstraint] | None = None,
-    ) -> None:
-        """One or more metrics with optional relative importance weights
-        and optional constraints on the metrics themselves.
-
-        `weights=None` with a single metric is the plain single-objective case.
-        `weights=None` with several metrics means no preference between them
-        (a standard Pareto multi-objective problem). Explicit weights scalarize
-        the preference between objectives; they do not control exploration
-        versus exploitation, which is `BayesianOptimizer.ask`'s `alpha` (section 4.3).
-        """
-
-    @property
-    def is_multi_objective(self) -> bool:
-        """Cheap (len check): snake_case."""
-
-
-# domain/Trial.py
-class Trial:
-    def __init__(
-        self,
-        parameters: dict[str, float | int | str | bool],
-        results: dict[str, float],
-        result_std: dict[str, float] | None = None,
-        trial_index: int | None = None,
-    ) -> None:
-        """One evaluated point: its parameters and its observed metric value(s).
-
-        `result_std`, when known (e.g. from repeated measurements), is passed
-        through as a fixed observation noise instead of being inferred by the
-        surrogate model.
-        """
-
-
-# domain/StudySnapshot.py
-class StudySnapshot:
-    """Everything needed to fully reconstruct a BayesianOptimizer: its
-    search space, objective, constraints, trial history, and
-    reproducibility metadata. The unit that persistence/ reads and
-    writes. Wraps, rather than duplicates, whatever Ax's own
-    Client.save_to_json_file already captures; see section 5.6."""
-```
-
-### 5.3 Backend layer
-
-```python
-# backends/OptimizationBackend.py
-class OptimizationBackend(ABC):
-    @abstractmethod
-    def createExperiment(self, search_space: SearchSpace, objective: Objective) -> None: ...
-
-    @abstractmethod
-    def attachTrial(self, trial: Trial) -> int:
-        """Registers an already-evaluated trial, returns its backend-assigned index."""
-
-    @abstractmethod
-    def suggestDefault(self, n_points: int) -> list[dict[str, float | int | str | bool]]:
-        """The no-manual-tuning default path (FR4), delegated entirely to the backend."""
-
-    @abstractmethod
-    def fitModel(self) -> Model:
-        """Fits and returns the current surrogate model. Used by the
-        acquisition layer, and directly exposed to callers as
-        BayesianOptimizer.fitModel() (FR16, ADR-0005)."""
-
-    @abstractmethod
-    def predict(
-        self, x: dict[str, float | int | str | bool]
-    ) -> dict[str, tuple[float, float]]:
-        """Returns {metric_name: (mean, sem)}. Matches Client.predict's own
-        return shape (predicted mean and standard error of the mean, not
-        variance) exactly, rather than converting to a different
-        uncertainty representation. Raises PredictionUnavailableError if the
-        backend has no model to predict with yet (AxBackend: while Ax is still in
-        its initial space-filling phase); BayesianOptimizer.predict then uses
-        boptim's own surrogate."""
-
-    @abstractmethod
-    def computeSensitivity(self) -> dict[str, dict[str, float]]:
-        """Returns {metric_name: {parameter_name: importance}}."""
-
-    @abstractmethod
-    def getParetoFrontier(self) -> list[Trial]:
-        """Delegates to Client.get_pareto_frontier(use_model_predictions=True),
-        not a hand-rolled non-domination scan over raw trial data."""
-
-    @abstractmethod
-    def getBestTrial(self) -> Trial | None:
-        """Delegates to Client.get_best_parameterization() for the
-        single-objective case."""
-
-
-# backends/ax/AxBackend.py
-class AxBackend(OptimizationBackend):
-    def __init__(
-        self,
-        random_seed: int | None = None,
-        method: Literal["quality", "fast", "random_search"] = "fast",
-        initialization_budget: int | None = None,
-        torch_device: str | None = None,
-    ) -> None:
-        """random_seed, method, initialization_budget, torch_device are
-        passed straight through to
-        Client.configure_generation_strategy (section 4.4); not
-        reinvented, just exposed at construction time."""
-
-    # implements every OptimizationBackend method by delegating to a private
-    # ax.api.client.Client instance; exact accessor names confirmed against
-    # https://ax.readthedocs.io/en/stable/api.html for this draft, re-check
-    # against whatever Ax version pyproject.toml ends up pinning.
-
-    @property
-    def client(self) -> Any:
-        """The live ax.api.client.Client. Returned as Any here to avoid
-        leaking an Ax import into this file's own public signature;
-        exposed to end users, typed as Ax's own Client, via
-        BayesianOptimizer.axClient (section 5.7, ADR-0005)."""
-
-
-# backends/ax/toAxSearchSpace.py
-def toAxSearchSpace(search_space: SearchSpace) -> list[Any]:
-    """Maps boptim Parameters to Ax's RangeParameterConfig /
-    ChoiceParameterConfig / DerivedParameterConfig list, and
-    LinearConstraint to the parameter_constraints string expressions
-    Client.configure_experiment expects. Return type kept as Any to avoid
-    leaking an Ax import into this file's own public signature."""
-
-
-# backends/ax/fromAxSearchSpace.py
-def fromAxSearchSpace(ax_parameters: list[Any]) -> SearchSpace:
-    """The inverse of toAxSearchSpace, used when reconstructing a
-    SearchSpace from a study loaded through Client.load_from_json_file
-    (section 5.6)."""
-
-
-# backends/ax/toAxOptimizationConfig.py
-def toAxOptimizationConfig(objective: Objective) -> tuple[str, list[str]]:
-    """Maps a boptim Objective to the (objective, outcome_constraints)
-    strings/string-list Client.configure_optimization expects, weighted or
-    unweighted as appropriate."""
-```
-
-### 5.4 Surrogate model and acquisition layer
-
-```python
-# models/SearchSpaceEncoder.py (ADR-0007)
-class SearchSpaceEncoder:
-    """Maps a SearchSpace onto the unit cube [0, 1]^d and back: Range -> one column (linear or
-    log scaled, rounded onto its grid for int/step ranges); ordered Choice -> one rank column;
-    unordered Choice -> a 0/1 column or a one-hot block; Fixed and Derived take no column.
-    decode() returns a parameterization Ax accepts: fixed values included, derived parameters
-    computed, parameters switched off by dependent_parameters dropped."""
-
-    def __init__(self, search_space: SearchSpace) -> None: ...
-    def encodeParameters(self, parameters: Mapping[str, LevelValue]) -> Tensor: ...
-    def decode(self, x: Tensor) -> dict[str, LevelValue]: ...
-    def snapColumns(self, x: Tensor) -> Tensor: ...
-    def sampleEncoded(self, n: int, seed: int | None = None, snap: bool = True) -> Tensor: ...
-    def rawRangeValues(self, x: Tensor) -> Tensor: ...  # natural values, for constraints
-    def roundingNeighbors(self, x: Tensor, max_ordinal: int = 8) -> Tensor: ...
-    def categoricalFixedFeatures(
-        self, max_combinations: int, seed: int | None = None
-    ) -> list[dict[int, float]]: ...
-
-
-# models/encodeTrials.py
-def encodeTrials(
-    encoder: SearchSpaceEncoder, objective: Objective, trials: Sequence[Trial]
-) -> tuple[Tensor, Tensor, Tensor | None]:
-    """(train_x, train_y, train_yvar). result_std becomes a fixed variance only when every
-    trial gives one for every metric; a partial set is ignored with a warning."""
-
-
-# models/buildSurrogateModel.py
-def buildSurrogateModel(
-    train_x: Tensor,
-    train_y: Tensor,
-    train_yvar: Tensor | None = None,
-    minimum_points_for_free_fit: int = 5,
-) -> Model:
-    """Builds and fits a SingleTaskGP with one independent, internally standardized output per
-    column of train_y (so also the multi-objective case). train_x is already in the unit cube,
-    so no input transform is applied. Infers observation noise when train_yvar is None.
-
-    Fitting is a MAP fit under BoTorch's default priors. minimum_points_for_free_fit is
-    accepted now and, in Phase 2, only logs a low-confidence message below it; the distinct
-    weakly-informative-prior fallback and explicit low-confidence signalling are Phase 3
-    (section 4.4). The single swap point for a scalable/sparse GP in a future version."""
-
-
-# acquisition/AcquisitionStrategy.py
-class AcquisitionStrategy(ABC):
-    @abstractmethod
-    def buildAcquisitionFunction(
-        self,
-        model: Model,
-        objective: Objective,
-        alpha: float,
-        reference_points: Tensor,
-    ) -> AcquisitionFunction: ...
-
-    @abstractmethod
-    def suggest(
-        self,
-        model: Model,
-        objective: Objective,
-        search_space: SearchSpace,
-        alpha: float,
-        n_points: int,
-        seed: int | None = None,
-    ) -> list[dict[str, float | int | str | bool]]:
-        """Any NonlinearConstraint found in search_space.constraints (FR17)
-        is converted by toBotorchNonlinearConstraints and passed to
-        optimize_acqf as nonlinear_inequality_constraints; no separate
-        parameter for it, since SearchSpace already carries it. Every returned
-        point satisfies the search space's parameter constraints."""
-
-    @abstractmethod
-    def suggestSpaceFilling(
-        self,
-        search_space: SearchSpace,
-        n_points: int,
-        seed: int | None = None,
-    ) -> list[dict[str, float | int | str | bool]]:
-        """The cold start, used while there are too few trials to fit a model:
-        constraint-satisfying scrambled-Sobol points."""
-
-
-# acquisition/toBotorchNonlinearConstraints.py
-def toBotorchNonlinearConstraints(
-    constraints: Sequence[NonlinearConstraint],
-    parameter_order: Sequence[str],
-    constants: Mapping[str, float] | None = None,
-) -> list[tuple[Callable[[Tensor], Tensor], bool]]:
-    """Compiles each NonlinearConstraint's string expression into the
-    Tensor-taking callable BoTorch's optimize_acqf expects for its
-    nonlinear_inequality_constraints argument (a value >= 0 meaning
-    feasible; ">=" constraints pass through as-is, "<=" constraints are
-    negated to fit that convention). parameter_order fixes which tensor
-    column is which parameter, since the callable only sees a Tensor, not
-    named values. constants supplies fixed numeric values an expression may
-    also reference. Each callable is intra-point (the bool is True) and returns
-    a Tensor, not a float: BoTorch differentiates it."""
-
-
-# acquisition/ExplorationExploitationAcquisition.py
-class ExplorationExploitationAcquisition(MCAcquisitionFunction):
-    """Blends a posterior-mean exploitation term and a posterior-variance
-    exploration term: score(x) = (1 - alpha) * exploitation(x) + alpha *
-    exploration(x), both min-max normalized over reference_points. See
-    section 4.3 for how pending points (batches) enter each term. Evaluates
-    single candidates (q = 1); batches are built sequentially via set_X_pending."""
-
-    def __init__(
-        self,
-        model: Model,
-        alpha: float,
-        minimize: bool,
-        reference_points: Tensor,
-        sampler: MCSampler | None = None,
-        posterior_transform: PosteriorTransform
-        | None = None,  # scalarizes a weighted objective
-        X_pending: Tensor | None = None,
-    ) -> None: ...
-
-    def forward(self, X: Tensor) -> Tensor: ...
-
-
-# acquisition/MultiObjectiveExplorationExploitationAcquisition.py
-class MultiObjectiveExplorationExploitationAcquisition(MultiObjectiveMCAcquisitionFunction):
-    """Multi-objective generalization for the unweighted case: exploitation is the
-    expected hypervolume improvement over the model-predicted Pareto front (via
-    qExpectedHypervolumeImprovement), exploration is the mean of the per-objective
-    normalized posterior variances. objective_weights multiplies each outcome before
-    comparison: negative for a minimized objective, 1 for a maximized one."""
-
-    def __init__(
-        self,
-        model: Model,
-        alpha: float,
-        objective_weights: Tensor | None,
-        ref_point: Tensor,
-        reference_points: Tensor,
-        sampler: MCSampler | None = None,
-        X_pending: Tensor | None = None,
-    ) -> None: ...
-
-    def forward(self, X: Tensor) -> Tensor: ...
-
-
-# acquisition/AlphaAcquisitionStrategy.py
-class AlphaAcquisitionStrategy(AcquisitionStrategy):
-    """The AcquisitionStrategy behind ask(alpha=...). Picks the single-objective function for one
-    metric or a weighted objective (on the weighted sum), the multi-objective one otherwise;
-    enumerates unordered choices with optimize_acqf_mixed; optimizes integer/grid/ordered
-    parameters as continuous relaxations and rounds them, repairing a rounding that breaks a
-    constraint; falls back to the best feasible random point if the optimizer returns an
-    infeasible one."""
-
-    def __init__(
-        self,
-        num_restarts: int = 10,
-        raw_samples: int = 512,
-        n_reference_points: int = 512,
-        n_mc_samples: int = 256,
-        max_categorical_combinations: int = 32,
-        max_iterations: int = 200,
-        polytope_burn_in: int = 200,
-        polytope_thinning: int = 10,
-    ) -> None:
-        """polytope_burn_in and polytope_thinning configure the hit-and-run sampler that draws
-        starting points inside linear constraints. BoTorch's own defaults (10000 and 32) are
-        much more expensive; 200 and 10 were chosen from measurements (burn-in made no
-        measurable difference to the sampled distribution, thinning is the expensive knob and
-        costs independence of the samples in high dimension), documented where the constants
-        are defined, `acquisition/sampleFeasibleEncoded.py`. Raise `polytope_thinning` for a
-        high-dimensional polytope."""
-```
-
-### 5.5 Analysis layer
-
-```python
-# analysis/SensitivityAnalyzer.py
-class SensitivityAnalyzer(ABC):
-    @abstractmethod
-    def computeSensitivity(
-        self, model: Model, search_space: SearchSpace, metric_names: Sequence[str]
-    ) -> dict[str, dict[str, float]]: ...
-
-
-# analysis/SobolSensitivityAnalyzer.py
-class SobolSensitivityAnalyzer(SensitivityAnalyzer):
-    def __init__(self, num_mc_samples: int = 1024) -> None: ...
-    def computeSensitivity(
-        self, model: Model, search_space: SearchSpace, metric_names: Sequence[str]
-    ) -> dict[str, dict[str, float]]:
-        """Fallback used when not delegating to Ax's built-in analysis, so the
-        acquisition-only code path (no AxBackend involved) still has parameter
-        importance available."""
-
-
-# analysis/PredictionResult.py
-@dataclass(frozen=True)
-class PredictionResult:
-    mean: dict[str, float]
-    sem: dict[str, float]
-    """Standard error of the mean: matches Client.predict's own (mean, sem)
-    return shape directly rather than converting to variance and
-    introducing a field Ax itself does not use."""
-
-    @property
-    def variance(self) -> dict[str, float]:
-        """sem squared over a handful of metrics: negligible cost,
-        snake_case even though it "computes" something, per section 10."""
-```
-
-### 5.6 Persistence layer
-
-```python
-# persistence/StudyRepository.py
-class StudyRepository(ABC):
-    @abstractmethod
-    def save(self, snapshot: StudySnapshot, path: str | Path) -> None: ...
-
-    @abstractmethod
-    def load(self, path: str | Path) -> StudySnapshot: ...
-
-
-# persistence/JsonStudyRepository.py
-class JsonStudyRepository(StudyRepository):
-    def save(self, snapshot: StudySnapshot, path: str | Path) -> None:
-        """Delegates the Ax-backed portion of the state to
-        Client.save_to_json_file(path) directly, and writes boptim's own
-        extras (parameter default/dependent_parameters metadata Ax's own
-        snapshot does not carry, plus ReproducibilityMetadata) alongside
-        it. Does not reimplement what Ax already serializes correctly."""
-
-    def load(self, path: str | Path) -> StudySnapshot:
-        """The inverse, built on Client.load_from_json_file(path)."""
-
-
-# persistence/ReproducibilityMetadata.py
-@dataclass(frozen=True)
-class ReproducibilityMetadata:
-    random_seed: int
-    library_versions: dict[str, str]
-    created_at: datetime
-    boptim_version: str
-```
-
-### 5.7 Public API facade
-
-`ask`/`tell` is the naming used by scikit-optimize and Optuna for exactly this pattern, so it
-was adopted here over the earlier `suggest`/`observe` names, for the sake of matching an
-established convention that both target audiences (ML practitioners and, increasingly, the
-BO-literate lab) are likely to already recognize. The constructor accepts either a plain list
-of `Parameter`s (the common case) or a fully-built `SearchSpace`/`Objective` pair (the case
-that needs constraints or multi-objective weighting spelled out), so simple use stays terse
-without losing access to the advanced path. `axClient` and `fitModel()` are the escape hatches
-from design philosophy #2 and ADR-0005.
-
-```python
-# api/BayesianOptimizer.py
-class BayesianOptimizer:
-    def __init__(
-        self,
-        parameters: Sequence[Parameter] | SearchSpace,
-        objective: Objective | Literal["minimize", "maximize"] = "minimize",
-        constraints: Sequence[Constraint] | None = None,
-        outcome_constraints: Sequence[OutcomeConstraint] | None = None,
-        name: str = "study",
-        random_seed: int | None = None,
-        backend: OptimizationBackend | None = None,
-        acquisition_strategy: AcquisitionStrategy | None = None,
-    ) -> None:
-        """The main entry point. Two ways to call it:
-
-        Common case: BayesianOptimizer(parameters=[Real(...), Integer(...)]).
-            A single, unnamed metric is assumed; objective="minimize" or
-            "maximize" picks its direction.
-        Advanced case: pass an already-built SearchSpace (carrying its own
-            constraints) and an already-built Objective (named metrics,
-            optional weights, optional outcome_constraints, single or
-            multi-objective). `constraints`/`outcome_constraints` must be
-            left None in that case (a ValueError is raised otherwise: the
-            SearchSpace/Objective already own their own constraints, so
-            passing both is an ambiguous request, not a merge).
-
-        backend defaults to AxBackend(random_seed=random_seed); injectable for
-        testing and for a future non-Ax backend. The real implementation will
-        likely type this with @overload for the two cases rather than the
-        single Union shown here, kept simple for this spec.
-        """
-
-    def tell(
-        self,
-        x: dict[str, float | int | str | bool],
-        y: dict[str, float],
-        y_std: dict[str, float] | None = None,
-    ) -> Trial:
-        """Manually inject an already-known point and its result(s). FR3.
-
-        x maps parameter name to value. y maps metric name to value, matching
-        however Objective's metrics were named (or the single default metric
-        name when the shorthand constructor was used). y_std, when known
-        (e.g. from repeated measurements), is passed through as a fixed
-        observation noise instead of being inferred by the surrogate model.
-        """
-
-    def ask(
-        self,
-        n_points: int = 1,
-        alpha: float | None = None,
-    ) -> list[dict[str, float | int | str | bool]]:
-        """Ask for the next n_points parameterizations to evaluate.
-
-        Args:
-            n_points: batch size requested at once. FR10.
-            alpha: exploration/exploitation trade-off in [0, 1]. 0.0 favors the
-                best predicted objective, 1.0 favors the least-known region,
-                0.5 balances both. FR5. If None, delegates to the backend's
-                own no-manual-tuning default strategy (FR4) instead of the
-                custom acquisition layer, UNLESS the search space has one or
-                more NonlinearConstraint (FR17): Ax's default strategy cannot
-                enforce one, so alpha is instead set to
-                DEFAULT_ALPHA_WHEN_FORCED (0.0) and a warning is logged
-                explaining the switch, rather than silently returning
-                candidates that might violate a constraint the caller
-                declared. Passing alpha explicitly always uses the custom
-                layer already, so nothing changes and no warning fires in
-                that case. See section 4.6, ADR-0006.
-        """
-
-    def predict(self, x: dict[str, float | int | str | bool]) -> PredictionResult:
-        """FR7, FR8. Uses the backend's own model when it has one; otherwise
-        (early in a study) boptim's own surrogate, fit on the trial history and
-        cached until the next tell() (ADR-0007). Raises PredictionUnavailableError
-        below two completed trials."""
-
-    def parameterImportance(self) -> dict[str, dict[str, float]]:
-        """Refits/queries the surrogate model: has a cost, camelCase. FR6."""
-
-    @property
-    def n_trials(self) -> int:
-        """len() over an already-held list: cheap, snake_case."""
-
-    @property
-    def paretoFront(self) -> list[Trial]:
-        """Delegates to the backend's getParetoFrontier() (Ax's own
-        Client.get_pareto_frontier under AxBackend, section 5.3), not a
-        hand-rolled non-domination scan. Has a cost, camelCase. Collapses
-        to a single-element list for a single-objective optimizer, via the
-        backend's getBestTrial()."""
-
-    def save(self, path: str | Path) -> None:
-        """FR11, FR12. See JsonStudyRepository, section 5.6."""
-
-    @classmethod
-    def load(cls, path: str | Path) -> BayesianOptimizer:
-        """FR11, FR12."""
-
-    @property
-    def axClient(self) -> Any:
-        """Escape hatch (FR16, ADR-0005): the live ax.api.client.Client
-        instance backing this optimizer. Raises TypeError if backend is
-        not an AxBackend. Typed Any here to avoid forcing an Ax import on
-        every caller of this file; the real return type is
-        ax.api.client.Client. Anything reached through this property is,
-        by definition, outside what boptim validates or keeps in sync with
-        its own domain objects: for example, a trial attached directly via
-        axClient.attach_trial(...) will not appear as a boptim Trial until
-        the caller also updates the boptim side, since boptim only learns
-        about it through this same escape hatch, not automatically."""
-
-    def fitModel(self) -> Model:
-        """Escape hatch (FR16, ADR-0005): the BoTorch surrogate model Ax
-        currently holds, so a caller can write and optimize their own
-        acquisition function with plain BoTorch and feed the result back
-        through tell(), without forking boptim to get an acquisition behavior
-        the alpha dial does not cover. This is Ax's model, in Ax's transformed
-        input space, and only exists once Ax has left its initial
-        space-filling phase; it is not the model ask(alpha=...) uses (that one
-        is fit by boptim itself, ADR-0007)."""
-```
-
-### 5.8 Usage example
-
-The common case, start to finish. Parameter and method names are chosen so this reads close
-to plain English, per the "clean but simple" ask that shaped this section.
-
-```python
-from boptim import BayesianOptimizer, Real, Integer, Categorical, Boolean
-
-bo = BayesianOptimizer(
-    parameters=[
-        Real("temperature", 20.0, 120.0),
-        Integer("num_layers", 1, 8),
-        Categorical("solvent", ["water", "ethanol", "toluene"]),
-        Boolean("use_catalyst", default=True),
-    ],
-    objective="maximize",
-)
-
-# seed with a point you already ran, if you have one (FR3)
-bo.tell(
-    {"temperature": 80.0, "num_layers": 3, "solvent": "water", "use_catalyst": True},
-    {"objective": 0.62},
-)
-
-# ask for a single point, leaning toward exploitation
-x = bo.ask(alpha=0.2)[0]
-y = run_my_experiment(**x)  # your own code: a real experiment or a training run
-bo.tell(x, {"objective": y})
-
-# ask for a batch of 3, balanced exploration/exploitation (FR10)
-batch = bo.ask(n_points=3, alpha=0.5)
-
-# what does the model currently believe, with uncertainty? (FR7, FR8)
-prediction = bo.predict(
-    {"temperature": 100.0, "num_layers": 4, "solvent": "ethanol", "use_catalyst": False}
-)
-print(prediction.mean, prediction.sem)
-
-bo.parameterImportance()  # FR6
-bo.save("study.json")  # FR11, FR12
-bo_reloaded = BayesianOptimizer.load("study.json")
-```
-
-A conditional search space (FR14, section 4.5), using Ax's own `dependent_parameters`
-mechanism directly rather than a boptim-invented one. This is the direct equivalent of the
-Keras Tuner example that set the minimum bar for this feature (`hp.conditional_scope("model_type", ["mlp"])`
-activating `hidden_units`, `hp.conditional_scope("model_type", ["cnn"])` activating
-`num_filters`):
-
-```python
-from boptim import BayesianOptimizer, Categorical, Integer
-
-bo = BayesianOptimizer(
-    parameters=[
-        Categorical(
-            "model_type",
-            ["mlp", "cnn"],
-            dependent_parameters={"mlp": ["hidden_units"], "cnn": ["num_filters"]},
-        ),
-        Integer("hidden_units", 8, 512),
-        Integer("num_filters", 8, 256),
-    ]
-)
-```
-
-A nonlinear feasibility constraint (FR17, section 4.6), and the automatic switch it triggers
-on the default path (ADR-0006):
-
-```python
-from boptim import BayesianOptimizer, Real, NonlinearConstraint
-
-bo = BayesianOptimizer(
-    parameters=[Real("var", 0.0, 10.0), Real("x", 0.0, 10.0), Real("z", 0.0, 3.0)],
-    constraints=[NonlinearConstraint("var * x ** z", "<=", 50.0)],
-    objective="maximize",
-)
-
-bo.ask()  # alpha left at its default: NOT Ax's usual no-tuning strategy here, since
-# Ax cannot enforce the constraint above. boptim switches to its own
-# acquisition layer with alpha=DEFAULT_ALPHA_WHEN_FORCED and logs a
-# warning saying so. bo.ask(alpha=0.3) would use that layer directly,
-# with no warning, since nothing is happening implicitly in that case.
-```
-
-The escape hatch (FR16, ADR-0005), for a feature `boptim` does not wrap, here Ax's closed-loop
-`run_trials` (section 4.7):
-
-```python
-bo.axClient.run_trials(max_trials=20)  # Ax drives the loop itself; see ADR-0005's caveat
-# about this bypassing boptim's own bookkeeping
-```
+## 5. Architecture
+
+### 5.1 Layers and dependency direction
+
+| Layer | Responsibility | May depend on |
+|---|---|---|
+| `core` | Registries and the kind table, component metadata, capability tags and the compatibility check, the component configuration base, errors, random-number derivation, runtime settings, plugin discovery. | nothing in boptim |
+| `domain` | Parameters, constraints, outcomes, trials, observations, search space, problem. Pure data, validation and serialization. | `core` |
+| `encoding` | Parameter and constraint encoding rules, the search-space encoder, encoded constraints, feasible sampling, the expression compiler. | `core`, `domain` |
+| `surrogates` | Surrogate contract and builders, nested kinds (kernels, likelihoods, outcome transforms, fitters), the fitted-surrogate wrapper, prediction results, the cache. | `core`, `domain`, `encoding` |
+| `goals` | Goal contract and built-in goals. | `core`, `domain` |
+| `designs` | Design contract and built-in designs. | `core`, `domain`, `encoding` |
+| `acquisition` | Acquisition contract, builders, native acquisition functions. | `core`, `domain`, `encoding`, `surrogates`, `goals` |
+| `optimizers` | Acquisition-optimizer contract and built-ins. | `core`, `domain`, `encoding`, `acquisition` |
+| `analyses` | Analysis contract and built-ins. | `core`, `domain`, `encoding`, `surrogates`, `goals` |
+| `stopping` | Stopping-criterion contract and built-ins. | `core`, `domain`, `surrogates`, `goals`, `analyses` |
+| `policies` | Policy contract, composed policy, recipes, opaque built-in policies. | every layer above |
+| `persistence` | Snapshot document, repository contract and built-ins, migrations, reproducibility metadata. | `core`, `domain` |
+| `config` | Study-level configuration and its loaders. | every registry layer |
+| `study` | The `Study` facade. | `core`, `domain`, `goals`, `policies`, `analyses`, `stopping`, `persistence`, `config` |
+| `adapters` | Optional adapters to third-party systems (Ax). | boptim's public contracts, plus the third-party package |
+
+A lower layer never imports a higher one. `core` and `domain` import no machine-learning library (torch, BoTorch, GPyTorch, Ax); `adapters` are never imported by the core except through plugin discovery. The rules are checked in CI (section 10.5). Persistence holds configuration as plain JSON-compatible data, which is why it does not depend on `config`.
+
+### 5.2 The central loop
+
+A study holds a problem, a goal, a policy and a history of trials. The caller asks for suggestions; the study gives the policy a read-only view of its state (every trial in every state, the goal, the problem) and receives candidate parameterizations. The study validates them against the problem, records them as pending trials with fresh identifiers and returns them. The caller evaluates them wherever and whenever it likes, then reports back: a completed trial with an observation, a failed trial with a reason, or an abandoned trial. Data gathered elsewhere can be attached at any time. Analyses and stopping criteria can be run at any time and never change the history.
+
+Asking never requires the previous suggestions to have been reported. Pending trials are part of the state the policy sees, so batches and asynchronous workers are first-class (FR10, FR23).
+
+### 5.3 Problem description (domain)
+
+**Search space.** An ordered set of uniquely named parameters and a set of parameter constraints. Parameter types are registered: range, choice and derived. A range has bounds, an integer or float type, an optional step and optional log scaling. A choice has values, an optional ordering flag (when unset, the encoding configuration decides how the choice is treated, section 3.4) and optional dependent parameters (conditional search spaces, FR14). A derived parameter is computed from others by an expression and is never searched. Any parameter may have a default value (FR13), validated against its own definition. Constraint types are registered too: linear (less-or-equal, greater-or-equal and equality, FR9) and nonlinear (an expression string in a restricted arithmetic grammar, never evaluated with Python's `eval`, FR17). Constraints are stated on natural values (what the caller sees), not on the encoding.
+
+**Serialization.** Every type has a stable tag (the `type` key) and round-trips through JSON exactly. Sugar constructors (real, integer, categorical, boolean, fixed) produce the base types and do not survive a round trip as separate types.
+
+**Purity.** The domain never contains engine vocabulary. In particular it contains no code that renders a parameter or a constraint in another system's syntax (section 3.9).
+
+### 5.4 Outcomes, trials and observations
+
+An **outcome** has a name and a kind. The kind decides how values are validated (a continuous value is a finite number; a binary value is a label), whether a noise standard deviation is meaningful, and which surrogates suit it. Kinds are registered; continuous and binary come first (FR24).
+
+A **trial** has a stable integer identifier assigned by the study and never reused, a parameterization, a state, an optional observation, optional free-form JSON-compatible metadata and, when failed, a reason. The allowed transitions are pending to completed, pending to failed and pending to abandoned. Data attached from outside enters directly as completed (or failed). The history is never silently rewritten: trials are not deleted or overwritten.
+
+An **observation** gives a value for every outcome of the problem and, where known, a noise standard deviation per outcome. Replicated evaluations of the same parameterization are allowed. Partial knowledge of noise (some observations with a deviation, some without) is handled by the surrogate according to its configuration, never by a hidden rule.
+
+### 5.5 Encoding
+
+Surrogates, acquisitions, optimizers and designs work on one encoding of the search space: a tensor in the unit cube whose columns are laid out by the parameter types. A range is one column, linear or logarithmic; an integer range or a stepped range is a continuous relaxation that is snapped back onto its grid; an ordered choice is one rank column; an unordered choice is a 0/1 column or a one-hot block; fixed and derived parameters occupy no column. Conditional parameters are encoded as ordinary columns, with a documented neutral value when inactive.
+
+The encoder is deterministic. Encoding then decoding a legal parameterization returns it exactly; decoding any point of the unit cube returns a legal parameterization (rounded, with inactive conditional parameters removed and derived parameters computed). Constraints are rewritten onto the encoding, and a point that violates them is never returned to the caller.
+
+Each parameter type and each constraint type owns its encoding rules, registered under its type name in the `parameter_encoding` and `constraint_encoding` kinds. The encoder iterates over registered rules; it does not branch on concrete classes. A type with no registered rule is an error raised when the encoder is built, naming the type and, when known, the plugin that should provide it.
+
+### 5.6 Surrogates
+
+A surrogate builder takes a build context (problem, encoder, observations as tensors with optional noise, random generator, runtime settings) and returns a fitted native model plus a **fit status**. The result is wrapped in a `Surrogate`, which binds the model to the encoding and offers the surrogate operations: predict at parameterizations, draw posterior samples, expose the native model, report the fit status and the outcomes it covers. A `Surrogate` works without a study (FR22).
+
+- **Composition.** A builder may expose its internal choices as nested kinds: kernel, likelihood, outcome transform, fitting procedure. Nested kinds use the same registry and configuration mechanism as any other (section 5.12). Which nested kinds exist is not fixed by this document.
+- **Outcome kinds.** A surrogate declares the outcome kinds it supports. A binary outcome needs a non-Gaussian likelihood and approximate inference; its predictions exist in two spaces, the latent function and the response probability, and a prediction always states which one it returns (section 3.11).
+- **Several outcomes.** How several outcomes are modelled (independent models, joint model) is the builder's declared choice and appears in its capability tags.
+- **Prediction semantics.** By default a prediction reports the uncertainty of the underlying function (epistemic, without observation noise). Including observation noise is an option of the prediction (FR8).
+- **Small data.** The default surrogate MUST remain usable with a handful of observations (section 8) and MUST report a low-data fit status instead of hiding it. The minimum number of observations needed to fit, and the threshold below which a fit is flagged as low-data, are policy values.
+- **Caching.** Refitting a surrogate whose data and configuration are unchanged is avoided. The cache key is the history version and the resolved configuration.
+
+### 5.7 Goals
+
+A goal is typed configuration, validated against the problem (the outcomes it names must exist and be of a suitable kind). It does three things and computes nothing. It **parameterizes** acquisitions and analyses (directions and weights, a level, constraints on outcomes). It **declares** capability tags (for example that it is a level-set goal). It **proposes** recipes (default policy configurations, in order of preference) and default analyses.
+
+The first goal types are *optimize* (one or several outcomes, a direction for each, optional scalarizing weights, optional constraints on outcomes: FR2, FR15), *level set* (one outcome and a level: the boundary where the outcome crosses it or, for a binary outcome, where the probability crosses the level: FR20) and *explore* (learn the outcomes as well as possible: FR21). A goal type is a registered component. Adding one never changes the core.
+
+### 5.8 Acquisition, acquisition optimizers and designs
+
+An **acquisition builder** receives the surrogate, the goal, the pending points, a reference set of encoded points where it needs one, and a random generator, and returns a native acquisition function. The catalogue is open. The exploration/exploitation blend with a single weight (FR5) is one entry among others, alongside the expected-improvement and upper-confidence-bound families, multi-objective hypervolume improvement, variance-based exploration and level-set acquisitions such as the straddle.
+
+An **acquisition optimizer** searches the encoded space for the point or batch that maximizes an acquisition under the constraints. It handles the mixed space (relaxation of grids and ordered choices followed by snapping, enumeration of categorical assignments) as its configuration says. It receives the pending points so that batches complement each other (FR10), and it returns only constraint-satisfying encoded points. Its fallbacks (what to do when rounding breaks a constraint, how many random candidates to try) are configuration, never hidden code paths.
+
+A **design** proposes points without a model: space-filling sequences or random draws. It always honours the constraints, and it can count the existing observations so that a warm start (FR3) does not repeat an initial phase unnecessarily.
+
+### 5.9 Policies
+
+A policy answers one question: which parameterizations should be evaluated next, given the state of the study. It is told about every change of a trial's state and is asked for suggestions. It may keep internal state, which it MUST be able to export and import so that persistence works.
+
+A **composed policy** is made of a design, a surrogate, an acquisition and an acquisition optimizer. It uses the design until a configured amount of data exists, then switches to the model-based phase; the switching rule is configuration. In the model-based phase it obtains a surrogate from the history (through the cache), builds the acquisition with the pending points, optimizes it, and decodes and validates the result.
+
+An **opaque policy** is any object honouring the policy contract: random search, grid search, an Ax adapter (FR27), or user code. A study treats both forms identically.
+
+**Defaults.** When the caller gives no policy, the study asks the goal for its recipes and takes the first one whose components are compatible with the problem (section 5.12). The *resolved* policy is stored in the study's configuration and can be inspected. It is never silently different from what is reported, and a study never switches policy afterwards. If no recipe is compatible, construction fails with an error that lists, for each unmet need, the registered components that would satisfy it.
+
+### 5.10 Analyses and stopping
+
+An **analysis** is a registered computation over a read-only study state that returns a typed, serializable result. It may need a surrogate (it asks the study for one), a goal type, or specific capabilities, and it declares so. The catalogue is open: recommendations (the best point, a Pareto front, a level-set estimate: the answer to the goal), parameter importance, prediction grids and slices, and model diagnostics such as leave-one-out checks and calibration (FR6, FR7, FR8). Each goal type lists default analyses.
+
+A **stopping criterion** is a registered evaluation of the study state that answers continue or stop, with a reason (a trial budget, no recent improvement, a resolved level set). The study reports the answer; it never stops the caller's loop by itself (FR28).
+
+### 5.11 Persistence and reproducibility
+
+A study is saved as one JSON document, human-inspectable (FR11, FR12). It contains: a format version; the study name; the problem; the goal; the **resolved** policy, analysis and stopping configuration; the full trial history with every state and reason; the number of asks so far; reproducibility metadata (study seed, versions of boptim and of the tracked libraries, creation time); a manifest of the registered component names in use (with plugin versions where known); and, where a component provides one, its exported opaque state (for example an adapter's own client state).
+
+Loading rebuilds an equivalent study from the document alone. In the same environment, a reloaded study makes the same next suggestions as the uninterrupted one would have, up to documented hardware nondeterminism. Loading fails with a clear error that names any component missing from the registries and, when known, the plugin that provides it. A library-version mismatch is reported, not ignored. A snapshot is data: loading it never executes code from the file. Format changes ship with migrations so that older documents stay loadable. A repository (the storage medium) is a registered component: JSON files first and an in-memory repository for tests; others, such as a SQL store, can be added without touching the study.
+
+Randomness: one study seed, recorded in the snapshot, feeds a stable derivation keyed by the ask index and the component path. Components never touch a global random state, and adding a component does not change the random streams of the others. When the caller gives no seed, one is drawn from the operating system and recorded.
+
+### 5.12 Registries, configuration, capabilities and plugins
+
+**Registries.** There is one registry per component kind. A component is registered under a unique name with a decorator, in the style `@registerSurrogate("single_task_gp_v1")`. A duplicate name is an error; an unknown name is an error that lists the available names. Names are lowercase snake_case, with a `_vN` suffix when behaviour differs between versions (section 3.7). An entry holds the builder, the configuration schema, a one-line description and the declared needs and supports.
+
+**Configuration.** Every component has a typed configuration (a Pydantic model) whose `type` field is the registered name; unknown fields are rejected. Components can nest other components in the same form (a surrogate holds a kernel, a composed policy holds a design, and so on). Configurations load from Python objects, JSON or YAML with identical meaning, and every validation error carries the path of the offending field. Defaults exist only in the schemas (section 3.4).
+
+**Capabilities.** Tags come from a documented vocabulary; an unknown tag is an error (this catches typos). The problem and the goal contribute tags too: a problem with categorical parameters needs `space:categorical`, a goal of type level set supports `goal:level_set`, several outcomes need `outputs:multi`. When a study is built, the compatibility check verifies that every need is met by a support from some participant (the problem, the goal, or a component of the policy). Unmet needs are reported together, with who needs each one and which registered components would meet it. A component may refine its declared tags from its own configuration.
+
+**Population.** A decorated component is registered only when its module has been imported. Every subpackage's `__init__` MUST import each of its concrete modules, and a test checks this.
+
+**Plugins.** An external package registers components by decorating them and is discovered through an entry-point group, or loaded explicitly by module name. A plugin needs no change to boptim and may extend the capability vocabulary. Plugins are trusted code; this is documented.
+
+### 5.13 Escape hatches
+
+The native objects are always reachable (FR16). The study's current surrogate exposes the BoTorch model the policy is actually using, never a different one. The policy object is accessible, and an adapter exposes its own client. Anything obtained this way is outside what boptim validates or keeps in sync, and the documentation says so. Writing a custom component is the preferred escape hatch, because it keeps persistence, reproducibility and compatibility checking.
 
 ---
 
-## 6. Roadmap
+## 6. Extension contracts
 
-The phases are sequenced by technical risk, not by feature importance: every functional
-requirement from section 2 is in scope, but the genuinely novel part (the alpha dial) is
-built once the foundation under it is solid, rather than the other way around.
+Every component, whatever its kind, MUST provide:
 
-**Phase 1: Foundation (domain model + Ax-backed default flow)**
-Full domain model, including `Range`/`Real`/`Integer`, `Choice`/`Categorical`/`Boolean`/
-`Fixed`/`Derived` with `dependent_parameters` (FR14's definition side), linear parameter
-constraints (FR9, `LinearConstraint`, Ax-native), outcome constraints (FR15), and
-multi-objective (`Objective` with N >= 1 metrics and optional weights), from the start: Ax's
-`Client` natively supports all of this, so this is realistically a mapping-layer effort, not a
-re-design later. `AxBackend` (including `getParetoFrontier`/`getBestTrial` delegating to Ax,
-and `predict` returning Ax's own (mean, sem) shape), manual injection, `ask()` via Ax's own
-default strategy, Ax's built-in sensitivity analysis, `JsonStudyRepository` wrapping Ax's own
-save/load, and the `axClient`/`fitModel()` escape hatches (FR16). Deliverable: a usable, if
-not yet alpha-controllable, end-to-end loop, plus `examples/lab_experiment.py` and
-`examples/escape_hatch.py`.
+- a stable registered name (section 5.12);
+- a configuration schema whose every field is described, including the meaning, unit and default of each policy value (section 3.4);
+- a one-line description;
+- declared needs and supports, truthful with respect to its behaviour (section 5.12);
+- a builder that is free of side effects at import and registration time, and deterministic given its configuration, its inputs and its random generator.
 
-**Phase 2: The exploration/exploitation acquisition layer**
-`ExplorationExploitationAcquisition` and its multi-objective variant, with batch support
-(fantasization-based sequential selection) built in from the start rather than retrofitted.
-This is FR5, the requirement Ax does not cover, and the reason this project exists rather
-than "just use Ax". `NonlinearConstraint` and `toBotorchNonlinearConstraints` (FR17) land in
-the same phase, since they are only enforceable once this layer exists; `ask()`'s automatic
-switch and warning (ADR-0006) is built and tested alongside them, not after. `examples/
-ml_hyperparameter_search.py` and `examples/nonlinear_constraint.py` follow once `alpha` is
-usable.
+What a component of each kind adds:
 
-*Status: implemented. See ADR-0007 (the layer fits its own surrogate), the corrected batch
-mechanism in section 4.3, and the evidence on the forced default in ADR-0006. Not yet covered,
-by design or by deferral: `OutcomeConstraint`s are not enforced by the custom layer (a warning
-is logged); `dependent_parameters` are optimized as if all were active and pruned when
-decoding (Phase 3 makes the layer reason about them); `LinearConstraint`s on log-scaled
-parameters are rejected by the custom layer.*
+| Kind | A component provides | It receives and returns |
+|---|---|---|
+| `parameter` | Schema, validation of values and defaults, a serialization tag. | Builds a domain parameter object. |
+| `constraint` | Schema, serialization tag, a feasibility check on natural values. | Builds a domain constraint object. |
+| `outcome_kind` | Value validation, rules on noise information, the tags of the surrogates that suit it. | Validates observed values. |
+| `parameter_encoding` | Column layout, encoding, decoding with snapping, the neutral value when inactive, sampling and rounding rules for one parameter type. | Used by the encoder. |
+| `constraint_encoding` | The encoded form of one constraint type (coefficient rows, or a differentiable callable) and its violation measure. | Used by the encoder and the optimizers. |
+| `surrogate` | A fitted native model for the given data, a fit status, the outcome kinds it supports. | Receives a build context; returns a model and a status. |
+| `kernel`, `likelihood`, `outcome_transform`, `fitter` | The corresponding native objects or procedures for a surrogate builder. | Receive the dimensions or the model they act on. |
+| `design` | Encoded points without a model. | Receives problem, encoder, constraints, existing trials, a count and a generator. |
+| `goal` | Configuration, tags, recipes, default analyses, validation against the problem. | Receives the problem. |
+| `acquisition` | A native acquisition function. | Receives surrogate, goal, pending points, reference points and a generator. |
+| `acquisition_optimizer` | Encoded candidates that maximize an acquisition under the constraints. | Receives acquisition, encoder, constraints, a count, pending points and a generator. |
+| `policy` | Suggestions, notification of trial changes, export and import of opaque state. | Receives the read-only study state. |
+| `analysis` | A typed, serializable result. | Receives the read-only study state and, on demand, a surrogate. |
+| `stopping` | A decision and a reason. | Receives the read-only study state. |
+| `repository` | Saving and loading snapshot documents. | Receives and returns a snapshot document. |
 
-**Phase 3: Robustness across the full budget range, and deferred hard problems**
-Weakly-informative-prior fallback for very small trial counts (down to the 4-5-evaluation
-case), explicit low-confidence signaling; the scalable/sparse-GP extension point in
-`buildSurrogateModel` documented (not necessarily implemented) for very large trial counts;
-FR14's harder half, making the custom acquisition layer actually reason about
-`dependent_parameters` instead of just not breaking on it; and, revisiting section 4.7,
-`simplify_parameter_changes`/BONSAI, given its direct relevance to a human reconfiguring lab
-equipment between trials.
+The set of kinds is itself open. A new kind needs two concrete implementations (section 3.10) and an ADR.
 
-**Phase 4: Polish, docs, packaging**
-Full `mkdocs` site (including the `docs/changelogs/` structure and `scripts/cut_release.py`),
-ADR-0003 and ADR-0004 written, CI green on lint/type-check/tests/`scripts/
-check_naming_convention.py`, `uv`-based packaging finalized, integration test covering the
-full tell/ask/save/load loop on a dummy objective, and `examples/conditional_search_space.py`
-alongside the two campaign-style examples, so the "general-purpose, not lab-specific" intent
-(section 1.1) is demonstrated, not just stated.
+---
+
+## 7. Reference use cases
+
+The reference use cases are the acceptance matrix of the architecture. They exist so that "everything is possible" (section 1.3) is verified and not merely claimed, and so that no contributor narrows the design to the exact request in front of them.
+
+### 7.1 The matrix
+
+| ID | Use case | Outcomes | Goal | What it proves |
+|---|---|---|---|---|
+| UC-1 | Single-objective optimization, noisy or deterministic, with input constraints | continuous | optimize | The default policy and the basic loop (FR1, FR4, FR9). |
+| UC-2 | Multi-objective optimization (Pareto front), with and without weights | several continuous | optimize | Multi-output surrogates, hypervolume acquisition, the Pareto analysis (FR2). |
+| UC-3 | Optimization with outcome constraints | several continuous | optimize with constraints | Goal-level constraints reaching the acquisition (FR15). |
+| UC-4 | Level-set estimation of a continuous outcome | continuous | level set | A goal that is not optimization: level-set acquisition and estimate (FR20). |
+| UC-5 | Boundary between two phases from binary labels | binary | level set | A non-Gaussian surrogate, latent and response spaces: the headline "phase boundary" case (FR20, FR24). |
+| UC-6 | Pure exploration (active learning) | continuous | explore | An acquisition with no direction (FR21). |
+| UC-7 | Surrogate only: fit, predict, sample, importance, diagnostics, no loop | continuous | none | The separation of layers (FR6, FR7, FR8, FR22). |
+| UC-8 | Batches, asynchronous asks, failed and abandoned trials | any | any | The trial lifecycle and pending points (FR10, FR23). |
+| UC-9 | Mixed, conditional and derived parameters with linear (including equality) and nonlinear constraints | any | any | The search space and its encoding (FR1, FR9, FR13, FR14, FR17). |
+| UC-10 | Warm start from existing data, then save, reload and continue | any | any | FR3, FR11, FR12 and deterministic replay. |
+| UC-11 | A study that uses a kernel, an acquisition and an analysis defined outside the package | any | any | The extension guarantee (FR18, FR19, section 1.3). |
+| UC-12 | An opaque policy (random search, a user-written policy, later an Ax adapter) driving the same study | any | any | The policy seam (FR27). |
+
+### 7.2 Rules for the matrix
+
+- Each use case MUST run from configuration plus registered components alone. UC-11 additionally runs from a separate package that imports only public contracts.
+- Each use case MUST have at least one integration test and one runnable example.
+- Each test states its acceptance numbers (budgets, tolerances, comparison with a random baseline) in the test itself, and is deterministic through seeds.
+- A change that breaks a use case is a regression even if every unit test passes.
+
+### 7.3 Horizon use cases
+
+Multi-fidelity and cost-aware optimization; safe exploration; high-dimensional trust-region search; preference and ranking data (comparisons instead of point observations); contextual problems; Bayesian quadrature; low-change (proximal) suggestions for laboratory practicality; transfer across studies.
+
+None is scheduled. The architecture MUST NOT make any of them impossible, and implementing one may require an ADR (for example, preference data changes the observation model). Horizon use cases are used in design reviews to challenge abstractions: if a proposed interface would forbid one of them, say so.
+
+---
+
+## 8. Quality attributes
+
+- **Budget range.** Defaults work from four or five observations to thousands. Scaling is a matter of components: a surrogate declares how it scales through a capability tag, and scalable surrogates are plugins.
+- **Numerical robustness.** Double precision by default for fitting. Jitter, noise floors and minimum variances are policy values. Non-finite values never propagate silently: they raise a named error.
+- **Determinism.** As in section 5.11.
+- **Errors.** As in section 3.6: one base class, messages that name the component, the field and a fix.
+- **Efficiency.** A surrogate is not refitted when its data and configuration are unchanged. Constant data (for example a reference set) is not recomputed within one ask. This document sets no performance figures.
+- **Observability.** Standard `logging`. Each ask logs at INFO which phase and which components were used. Degraded situations (a low-data fit, a fallback taken, a failed plugin) log a warning. Library code never prints.
+- **API stability.** The public API is the set of names re-exported by the top-level package. Versions are semantic; before 1.0 a minor version may break the API, and every break is listed in the changelog.
+- **Security.** Expressions are never evaluated with `eval`. A snapshot is data and loading it executes no code from the file. A plugin is code and is trusted.
+- **Portability.** Pure Python. CPU by default; the device is a runtime setting. No module-level global state.
+- **Documentation.** Every extension kind and every reference use case has a how-to.
+
+---
+
+## 9. Package map and illustrative configurations
+
+### 9.1 Package map
+
+The package layout mirrors the layers of section 5.1: `src/boptim/<layer>/`, plus the top-level `logging_config.py` and the public, lazily loaded re-exports in `__init__.py`. Other directories:
+
+- `tests/` mirrors `src/` (`tests/unit/<layer>/`), with `tests/integration/` for cross-layer tests and `tests/use_cases/` for the reference use cases of section 7.
+- `examples/` holds runnable walkthroughs (at least one per reference use case), and `examples/plugins/` shows components that live in external packages.
+- `scripts/` holds repository tooling: the naming check, the policy-value check, the layering check, and the ADR and release scaffolding.
+- `docs/` holds this specification, the roadmap, the ADRs, the changelogs, the how-to guides and the API reference.
+
+### 9.2 Illustrative configurations
+
+Non-normative. Component names and numbers below are the caller's choices in these examples; the catalogue of built-in components is documented separately and is not fixed by this specification.
+
+**Optimization with the default policy.** The goal proposes recipes and the first compatible one is used. The resolved policy is stored in the snapshot.
+
+```yaml
+problem:
+  parameters:
+    - {type: range, name: temperature, bounds: [20.0, 80.0]}
+    - {type: range, name: concentration, bounds: [0.01, 1.0], scaling: log}
+    - {type: choice, name: catalyst, values: [A, B, C], parameter_type: str, is_ordered: false}
+  outcomes:
+    - {name: yield, type: continuous}
+goal:
+  type: optimize
+  outcomes: {yield: maximize}
+```
+
+**Boundary between two phases from binary labels, with an explicit policy.** The surrogate is a classifier; the acquisition scores closeness to the boundary weighted by uncertainty.
+
+```yaml
+problem:
+  parameters:
+    - {type: range, name: temperature, bounds: [300.0, 900.0]}
+    - {type: range, name: pressure, bounds: [1.0, 100.0], scaling: log}
+  outcomes:
+    - {name: phase, type: binary}
+goal:
+  type: level_set
+  outcome: phase
+  level: 0.5
+policy:
+  type: composed_v1
+  design: {type: sobol_v1, n_points: 12}
+  surrogate:
+    type: variational_gp_classifier_v1
+    kernel: {type: matern_v1, nu: 2.5, ard: true}
+  acquisition: {type: straddle_v1, beta: 1.96}
+  acquisition_optimizer: {type: botorch_mixed_v1}
+analyses:
+  - {type: level_set_estimate_v1}
+stopping:
+  - {type: max_trials_v1, n_trials: 60}
+seed: 7
+```
+
+**A component defined in user code.** The shape only; the exact decorator arguments are defined by the code and its docstrings.
+
+```python
+@registerAcquisition("my_boundary_score_v1")
+class MyBoundaryScoreBuilder(AbstractAcquisitionBuilder):
+    ...  # configuration schema, needs and supports, a build method
+```
+
+After registration, `acquisition: {type: my_boundary_score_v1}` works in any configuration, and the study stores, reloads and compatibility-checks it like a built-in component.
 
 ---
 
 ## 10. Coding standards
 
-*(Section numbers 7-9 and 11 are intentionally left open, consistent with the numbering style
-of the source template this document extends.)*
+### 10.1 Tooling and runtime
 
-- **Language/runtime:** Python 3.11+
-- **Formatting/linting:** `ruff` (lint + format), consistent import ordering.
-- **Naming convention (custom, overrides PEP8 default for callables and for file names):**
-  - Classes -> `CamelCase` (e.g. `SearchSpace`, `Real`, `ExplorationExploitationAcquisition`).
-  - Variables (including function/method parameters) -> `snake_case` (e.g. `n_points`, `random_seed`).
-  - Functions and methods -> same rule as classes but starting lowercase, i.e. `camelCase`
-    (e.g. `suggestDefault`, `computeSensitivity`, `buildAcquisitionFunction`), not PEP8's usual
-    `snake_case` for callables. Python's required dunder methods (`__init__`, `__repr__`, ...)
-    are exempt: they keep their mandatory spelling.
-  - **File names match the file's single public symbol exactly**, including its case: a file
-    defining `class BayesianOptimizer` is `BayesianOptimizer.py`, not `bayesian_optimizer.py`;
-    a file defining `def buildSurrogateModel(...)` is `buildSurrogateModel.py`. This is the
-    "one class per file" rule (already required by this section) taken one step further: if a
-    file's name and its one symbol's name can drift apart, they will, over refactors. A file
-    with more than one closely related symbol and no single obvious name (rare, given "one
-    responsibility per file") keeps a descriptive `snake_case` name instead; `logging_config.py`
-    (section 5.1) is that case, not an exception to avoid. Python's own required module names
-    (`__init__.py`, `conftest.py`, ...) are exempt, the same way dunder methods are.
-    `scripts/check_naming_convention.py` (section 5.1) enforces this in CI, since `ruff`'s
-    naming rules do not cover file names against class/function names.
-  - Properties (`@property`) are named by **cost, not by whether they compute anything**:
-    - If accessing the property does real work (recomputes something from the full trial
-      history, calls into a model, is not O(1)-ish) -> `camelCase`, exactly like a method,
-      even though it is called without parentheses. Example: `BayesianOptimizer.paretoFront`.
-    - If it just returns an already-stored or negligible-cost value -> `snake_case`, like a
-      variable. Example: `BayesianOptimizer.n_trials`, `PredictionResult.variance`.
-    - The point is that the caller can tell, from the name alone, whether touching this
-      attribute is free or not.
-  - Since this deviates from PEP8, disable/adjust `ruff`'s naming rules (`N802`, `N803`,
-    `N806`) in `pyproject.toml` and note the exception in `docs/contributing.md`, so linting
-    doesn't silently "fix" it back to snake_case later.
-- **Typography:** no em dashes (`—`) in code, comments, docstrings, commit messages, or project
-  documentation. Use a period, a colon, parentheses, or two sentences instead. This is a house
-  style rule, not a technical one, so there is no linter for it; review for it like any other
-  style note. Same for arrows (`→`), use `->` instead.
-- **Typing:** type hints mandatory everywhere; `mypy --strict` run in CI.
-- **Docstrings:** Google-style, mandatory on every public class/function: purpose, `Args`,
-  `Returns`, `Raises`.
-- **Modularity:** one responsibility per file; one class per file. No god-files: a base class,
-  its registry, and every concrete strategy each get their own file (see section 5.1's package
-  layout for what this looks like in practice: `parameters/`, `constraints/`, `acquisition/`
-  each split this way).
-- **Testing:** `pytest`. Unit tests per module, plus an integration test that runs the full
-  tell/ask/save/load loop end to end on a dummy objective (shape and gradient sanity
-  checks where tensors are involved).
-- **Logging:** standard `logging` module, no bare `print`.
-- **Version control:** Conventional Commits, semantic versioning. Changelog entries are
-  versioned files, not one growing document: each release gets its own
-  `docs/changelogs/changelog-vX.Y.Z.md`, written once and never edited after release (the same
-  "new file records what changed, old ones stay put" spirit as the ADRs below), and
-  `docs/changelogs/CHANGELOG.md` is a short running index linking to each of them.
-  `scripts/cut_release.py` scaffolds this at release time. Architectural decisions get a new
-  ADR when they change, rather than an old ADR being edited in place (see `docs/adr/0002-*.md`
-  for an example of a decision recorded this way).
-- **CI:** GitHub Actions running lint, type-check, tests, and `scripts/
-  check_naming_convention.py` on every push.
-- **Documentation:** `mkdocs` + `mkdocstrings` built from docstrings; major architectural
-  choices (e.g. "why a hybrid Ax + BoTorch architecture", "why Pydantic domain models
-  decoupled from Ax's own types", "why escape hatches to Ax and BoTorch") recorded as short
-  ADRs (`docs/adr/NNNN-title.md`).
-- **Flexibility:** the code should be as flexible and generalist as possible so it can be
-  adapted to any user, lab or otherwise. Avoid hard-coded values that may be significant to a
-  particular user; define sensible defaults instead (see section 1.4 for the defaults chosen
-  in this draft, and section 4.4 for how this plays out for very small vs. very large trial
-  budgets).
-- **Don't recode what's already coded.** Before adding a new abstraction, check whether
-  Ax (https://ax.readthedocs.io/en/stable/api.html) or BoTorch already has the shape needed;
-  section 4.5 and 4.6 are the running record of that check for this project, kept up to date
-  rather than done once and forgotten.
+Python 3.11 or later. `uv` manages the project and its dependencies (ADR-0002). `ruff` lints and formats (its rules live in `pyproject.toml`). `mypy` runs in strict mode. `pytest` runs the tests. `mkdocs` with `mkdocstrings` builds the documentation. GitHub Actions runs everything on every push and pull request (section 10.13).
+
+### 10.2 Naming
+
+The project deliberately deviates from PEP 8 for callables and for file names. The deviation is enforced, so do not "fix" it back to snake_case.
+
+- **Classes**: `CamelCase`.
+- **Variables**, including function and method parameters: `snake_case`.
+- **Functions and methods**: `camelCase` (for example `buildSurrogate`, `registerAcquisition`). Python's required dunder methods keep their mandatory spelling.
+- **File names match the file's single public symbol exactly, including case**: a file defining `class Study` is `Study.py`; a file defining `def buildSurrogate` is `buildSurrogate.py`. A file with several closely related symbols and no single obvious name keeps a descriptive `snake_case` name (`logging_config.py` is that case). Python's required module names (`__init__.py`, `conftest.py`) are exempt.
+- **Properties** are named by cost, not by whether they compute anything. If reading the property does real work (recomputes from the history, calls a model), it is `camelCase` like a method. If it returns an already-stored or negligible-cost value, it is `snake_case` like a variable. The caller can tell from the name whether touching it is free.
+- **Registered component names** are lowercase snake_case with an optional `_vN` suffix. **Capability tags** are lowercase `group:name`. **Configuration keys** are snake_case.
+
+`ruff` has the `N802`, `N803`, `N806` and `N999` rules disabled for this reason, and `scripts/check_naming_convention.py` checks the file-name rule in CI.
+
+### 10.3 Typography
+
+No em dashes in code, comments, docstrings, commit messages or project documentation. Use a period, a colon, parentheses or two sentences instead. No unicode arrows: write `->`. A test enforces this, ignoring inline code spans so that the rule itself can be documented.
+
+### 10.4 Typing and docstrings
+
+Type hints are mandatory everywhere, and `mypy --strict` passes. Docstrings are Google style and mandatory on every public class, function and method: purpose, `Args`, `Returns`, `Raises`. The description of a configuration field states what the value means, its unit, and why its default is what it is.
+
+### 10.5 Modularity and layering
+
+One responsibility per file; one class per file for components. A base class, its registry, its decorator and every concrete implementation each get their own file. No god-files. Subpackages depend on each other only in the direction of section 5.1; `scripts/check_layering.py` enforces it, and enforces that `core` and `domain` import no machine-learning library and that only `adapters` import Ax.
+
+### 10.6 Registry rules
+
+- Every choice that has a registry kind goes through the registry (section 3.3). No algorithm imports a concrete component class to make a choice.
+- Registration is by decorator, at import time.
+- Every subpackage's `__init__` imports each of its concrete modules, one line per file, or the component is silently unregistered. A completeness test checks this.
+- A registered name is permanent. A change that alters results gets a new `_vN` name.
+- Every kind has an abstract contract, a registry and a registration decorator, each in its own file.
+- Every entry declares needs and supports, and a test checks that the declaration is truthful: a component that declares it supports something works with it, and one that does not declare it fails the compatibility check with a clear message.
+- One contract test runs over every registry (names, schemas, descriptions, tags, builders).
+
+### 10.7 Policy values
+
+Section 3.4 states the rule. The mechanism:
+
+- `scripts/check_policy_values.py` finds numeric literals other than 0, 1, -1 and 2 (any numeric spelling) in library code. Files whose single public symbol is a configuration schema (a class named `...Config`) are where defaults legitimately live and are not scanned. Tests and scripts are not scanned.
+- A literal is exempt when its line carries `# structural: <reason>` with a non-empty reason (for example `# structural: tensor axis`, `# structural: unit-cube midpoint`). The marker is for mathematical definitions only; using it on a tunable value is a defect that review must catch.
+- The check is a ratchet against a baseline file. A new violation fails the check, and so does a stale baseline entry: entries are only ever removed. The baseline MUST be empty before the first release of the new architecture.
+- The check cannot see strings, booleans or rules hidden behind an allowed literal. Review is the control for those.
+
+### 10.8 Configuration
+
+Configuration schemas are Pydantic v2 models with unknown fields rejected, a description on every field, and validators whose messages name the field. Defaults live only in schemas. There is no dictionary-of-strings configuration scattered through the code. An operation with tunable options takes one options object (itself a configuration schema) instead of a list of keyword arguments with literal defaults. A configuration built in Python, loaded from JSON and loaded from YAML has identical meaning.
+
+### 10.9 Dependencies and engine APIs
+
+Core dependencies: torch, botorch, gpytorch, pydantic, numpy, and a YAML reader. Optional extras: `ax`, `dev`, `docs`. Optional packages are imported lazily, inside the adapter that needs them, and the core MUST import and run without them. Version ranges go in `pyproject.toml` and exact versions in `uv.lock`.
+
+Third-party names and signatures are verified against the installed version before they are used (introspection, or reading the installed source). Never write engine API from memory. If something a task or a specification names does not exist in the installed version, stop and report it instead of inventing a substitute.
+
+### 10.10 Errors and logging
+
+Every error raised by the library derives from one base class and carries a message that names the component, the field and a fix. Loggers are `logging.getLogger(__name__)` and are children of the `boptim` logger, which carries a `NullHandler`; library code never configures handlers. Library code never calls `print` (examples and scripts may print their results).
+
+### 10.11 Testing
+
+`pytest`. The following are required:
+
+- unit tests per module, mirroring the source tree;
+- the registry contract test over every kind (section 10.6) and the completeness test;
+- round-trip tests for everything serializable (domain objects, configurations, snapshots) and for the encoder (encode then decode returns the parameterization);
+- capability-truthfulness tests (section 10.6);
+- determinism tests: the same seed gives the same suggestions, and save, reload and continue gives the same suggestions as an uninterrupted run;
+- one integration test per reference use case (section 7);
+- a test that `core` and `domain` import no machine-learning library, and one that the package imports and runs a default study without Ax;
+- the typography test (section 10.3);
+- parity tests whenever a component replaces another: the new one is compared with the old on a fixed problem, within tolerances stated in the test, before the old one is deleted.
+
+No test uses the network. Stochastic tests use fixed seeds and state their tolerances; a tolerance is never loosened to make a test pass without saying so. Coverage has a floor in CI that only ever goes up.
+
+### 10.12 Documentation and records
+
+`mkdocs` and `mkdocstrings` build the API reference from docstrings. Every extension kind and every reference use case has a how-to. Architectural decisions are ADRs under `docs/adr/`, written from the project's template with `scripts/new_adr.py`.
+
+### 10.13 Version control and CI
+
+Conventional Commits and semantic versioning. One task, one pull request. Each release gets its own `docs/changelogs/changelog-vX.Y.Z.md`, written once and not edited afterwards, and `docs/changelogs/CHANGELOG.md` is the running index (`scripts/cut_release.py` scaffolds both).
+
+CI runs on every push and pull request: `ruff check`, `ruff format --check`, the naming check, the policy-value check, the layering check, `mypy`, `pytest` with coverage, and the documentation build.
+
+### 10.14 New-component checklist
+
+1. Define the configuration schema, with every policy value described.
+2. Implement the builder, with no literal policy value.
+3. Register it under a new name, one class per file.
+4. Declare its needs and supports.
+5. Import it in its subpackage's `__init__`.
+6. Add tests: validation of the configuration, behaviour, capability truthfulness. The registry contract test covers it automatically.
+7. Add or update the documentation entry.
+8. If it creates a new kind, write an ADR and satisfy the rule of two (section 3.10).
 
 ---
 
-## 12. How future Claude conversations (and contributors) should use this document
+## 11. Decisions and records
 
-- Treat sections 0, 2, 3, 5 and 10 as the contract: search-space types, functional
-  requirements, the technology choices and their rationale (section 4.8's ADRs), the package
-  layout, and the naming/style rules. Do not silently deviate from them; propose a change and,
-  if accepted, update the relevant ADR or section rather than drifting from it in code.
-- Section 1.4 ("Defaults chosen for this draft") lists the handful of decisions made to keep
-  this document concrete rather than because they were architecturally required. These are
-  safe to revisit without re-opening the rest of the design.
-- Section 5's signatures are the target shape of the code, not yet the code. When
-  implementing, keep the signatures; if a signature turns out to be wrong once real code is
-  written against it, update this document in the same change, not after.
-- Before adding any new domain abstraction, check it against Ax's and BoTorch's own API
-  reference first (section 4.7 is the running list of what was deliberately deferred, not
-  missed); this document was revised more than once specifically because an earlier draft
-  invented a mechanism (conditional parameters via a custom `Condition` class) that Ax already
-  provides (`dependent_parameters`). Don't repeat that.
-- If a request does not have a clear answer in this document (a new feature, a changed
-  requirement, an ambiguous naming case not covered by section 10), do not guess: ask, the way
-  this document itself was produced through a round of clarifying questions before being
-  written. Once answered, fold the answer back into this document so the next conversation
-  does not have to ask again.
+- Architectural decisions are ADRs: context, decision, options considered, consequences. When a decision changes, a new ADR supersedes the old one; the old one's status line says so and its text is not edited.
+- Where an existing ADR conflicts with this specification, this specification wins, and the roadmap carries a task to supersede that ADR with a new one.
+- Open decisions are tracked in the roadmap's decision table, each with a proposed default. A contributor who needs an open decision MUST ask. A proposed default is used only once the owner has accepted it, and its use is recorded in the pull request description.
+
+---
+
+## 12. How contributors (human or LLM) use this document
+
+### 12.1 Rules
+
+1. Treat the terms of section 4 as canonical.
+2. Before implementing a request, run the request check (section 12.2) and write down its answers.
+3. Flag, do not silently adapt (section 12.3).
+4. New choices are components: registry, configuration, capabilities (sections 3.3, 5.12, 10.6).
+5. New tunable values are configuration fields, never literals (sections 3.4, 10.7).
+6. Do not narrow the design to the exact request. Deliver the request as the first instance of a mechanism and say what other instances the mechanism now allows (section 3.2).
+7. Respect the task boundaries of the roadmap: one task at a time, all of it. If a task is too big, stop and split it; never shrink it silently. Placeholders (`pass`, `NotImplementedError`, `TODO`) are not deliverables.
+8. Tests, documentation and ADRs ship with the code.
+9. When something is ambiguous, or an open decision is needed, ask.
+
+### 12.2 The request check
+
+Answer these six questions, in writing, before coding:
+
+1. **Layer.** Which layer owns this? Name it.
+2. **Axis.** What varies here? Name at least two other plausible values of the thing being requested.
+3. **Seam.** Is there a registry kind for that axis? If not, does the rule of two (section 3.10) justify creating one?
+4. **Values.** Which policy values does this introduce, where do they live in the configuration, and what are their defaults?
+5. **Capabilities.** Which tags does it need, and which does it support?
+6. **Use cases.** Which reference use cases does it touch or enable, and which tests change?
+
+### 12.3 What must be flagged
+
+A contributor MUST stop and raise the point, instead of implementing silently, when a request:
+
+- belongs to a different layer from the one it targets;
+- would hard-code a choice that has, or should have, a registry kind;
+- would add a literal policy value;
+- would narrow a mechanism to the requested instance;
+- conflicts with a principle of section 3 or with a reference use case;
+- needs a decision that is still open in the roadmap.
+
+### 12.4 Errors this section exists to prevent
+
+These happened in this project's history. They are listed so that they are recognized when they come back in a new form.
+
+- A model-level operation (prediction, parameter importance) was attached to the optimizer facade without saying that it belonged to the surrogate layer.
+- A specific model class, outcome transform and fitting routine were hard-wired inside a function documented as the "swappable" place to change them.
+- Numeric constants with good names were treated as acceptable, although the caller had no way to change them.
+- An exploration weight was delivered as the only way of choosing points, instead of as one acquisition among others.
+- A second engine and a second surrogate were built beside the first to work around a limit, instead of moving the seam so that both could use one.
